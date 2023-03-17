@@ -18,6 +18,7 @@ use futures::stream::TryStreamExt;
 use log::debug;
 use serde::Deserialize;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -192,12 +193,83 @@ impl std::fmt::Display for ModuleType {
 // that happened; not only first and final target. It would simplify a lot
 // of things throughout the codebase otherwise we may end up requesting
 // intermediate redirects from file loader.
-#[derive(Debug, Clone, Eq, PartialEq)]
+// NOTE: This should _not_ be made #[derive(Clone)] unless we take some precautions to avoid excessive string copying.
+#[derive(Debug)]
 pub struct ModuleSource {
-  pub code: Box<[u8]>,
+  pub code: ModuleCode,
   pub module_type: ModuleType,
   pub module_url_specified: String,
   pub module_url_found: String,
+}
+
+/// Module code can be sourced from strings or bytes that are either owned or borrowed. This enumeration allows us
+/// to perform a minimal amount of cloning and format-shifting of the underlying data.
+///
+/// Examples of ways to construct a [`ModuleSource`] object:
+///
+/// ```rust
+/// # use deno_core::modules::ModuleCode;
+///
+/// let code: ModuleCode = "a string".into();
+/// let code: ModuleCode = b"a string".as_slice().into();
+/// ```
+#[derive(Debug)]
+pub enum ModuleCode {
+  String(Cow<'static, str>),
+  Bytes(Cow<'static, [u8]>),
+}
+
+impl ModuleCode {
+  pub fn as_bytes(&self) -> &[u8] {
+    match self {
+      Self::Bytes(Cow::Borrowed(b)) => b,
+      Self::Bytes(Cow::Owned(b)) => b.as_ref(),
+      Self::String(Cow::Borrowed(s)) => s.as_bytes(),
+      Self::String(Cow::Owned(s)) => s.as_bytes(),
+    }
+  }
+}
+
+impl Default for ModuleCode {
+  fn default() -> Self {
+    ModuleCode::Bytes(Cow::Borrowed(&[]))
+  }
+}
+
+impl From<Cow<'static, str>> for ModuleCode {
+  fn from(value: Cow<'static, str>) -> Self {
+    ModuleCode::String(value)
+  }
+}
+
+impl From<Cow<'static, [u8]>> for ModuleCode {
+  fn from(value: Cow<'static, [u8]>) -> Self {
+    ModuleCode::Bytes(value)
+  }
+}
+
+impl From<&'static str> for ModuleCode {
+  fn from(value: &'static str) -> Self {
+    ModuleCode::String(Cow::Borrowed(value))
+  }
+}
+
+impl From<String> for ModuleCode {
+  fn from(value: String) -> Self {
+    ModuleCode::String(Cow::Owned(value))
+  }
+}
+
+impl From<Vec<u8>> for ModuleCode {
+  fn from(value: Vec<u8>) -> Self {
+    ModuleCode::Bytes(Cow::Owned(value))
+  }
+}
+
+impl From<&'static [u8]> for ModuleCode {
+  fn from(value: &'static [u8]) -> Self {
+    ModuleCode::Bytes(Cow::Borrowed(value))
+  }
 }
 
 pub(crate) type PrepareLoadFuture =
@@ -323,7 +395,7 @@ pub(crate) fn resolve_helper(
 /// Function that can be passed to the `ExtModuleLoader` that allows to
 /// transpile sources before passing to V8.
 pub type ExtModuleLoaderCb =
-  Box<dyn Fn(&ExtensionFileSource) -> Result<String, Error>>;
+  Box<dyn Fn(&ExtensionFileSource) -> Result<Cow<'static, str>, Error>>;
 
 pub struct ExtModuleLoader {
   module_loader: Rc<dyn ModuleLoader>,
@@ -440,7 +512,7 @@ impl ModuleLoader for ExtModuleLoader {
         load_callback(file_source)
       } else {
         match file_source.code.load() {
-          Ok(code) => Ok(code),
+          Ok(code) => Ok(code.into()),
           Err(err) => return futures::future::err(err).boxed_local(),
         }
       };
@@ -448,7 +520,7 @@ impl ModuleLoader for ExtModuleLoader {
       return async move {
         let code = result?;
         let source = ModuleSource {
-          code: code.into_bytes().into_boxed_slice(),
+          code: code.into(),
           module_type: ModuleType::JavaScript,
           module_url_specified: specifier.clone(),
           module_url_found: specifier.clone(),
@@ -529,7 +601,7 @@ impl ModuleLoader for FsModuleLoader {
 
       let code = std::fs::read(path)?;
       let module = ModuleSource {
-        code: code.into_boxed_slice(),
+        code: code.into(),
         module_type,
         module_url_specified: module_specifier.to_string(),
         module_url_found: module_specifier.to_string(),
@@ -786,14 +858,14 @@ impl RecursiveModuleLoad {
             scope,
             self.is_currently_loading_main_module(),
             &module_source.module_url_found,
-            &module_source.code,
+            module_source.code.as_bytes(),
             self.is_dynamic_import(),
           )?
         }
         ModuleType::Json => self.module_map_rc.borrow_mut().new_json_module(
           scope,
           &module_source.module_url_found,
-          &module_source.code,
+          module_source.code.as_bytes(),
         )?,
       },
     };
@@ -1826,7 +1898,7 @@ import "/a.js";
       }
       match mock_source_code(&inner.url) {
         Some(src) => Poll::Ready(Ok(ModuleSource {
-          code: src.0.as_bytes().to_vec().into_boxed_slice(),
+          code: src.0.into(),
           module_type: ModuleType::JavaScript,
           module_url_specified: inner.url.clone(),
           module_url_found: src.1.to_owned(),
@@ -2265,9 +2337,7 @@ import "/a.js";
       let info = ModuleSource {
         module_url_specified: specifier.to_string(),
         module_url_found: specifier.to_string(),
-        code: b"export function b() { return 'b' }"
-          .to_vec()
-          .into_boxed_slice(),
+        code: b"export function b() { return 'b' }".as_slice().into(),
         module_type: ModuleType::JavaScript,
       };
       async move { Ok(info) }.boxed()
@@ -2407,7 +2477,7 @@ import "/a.js";
         let info = ModuleSource {
           module_url_specified: specifier.to_string(),
           module_url_found: specifier.to_string(),
-          code: code.as_bytes().to_vec().into_boxed_slice(),
+          code: code.into(),
           module_type: ModuleType::JavaScript,
         };
         async move { Ok(info) }.boxed()
@@ -2775,17 +2845,13 @@ if (import.meta.url != 'file:///main_with_code.js') throw Error();
           "file:///main_module.js" => Ok(ModuleSource {
             module_url_specified: "file:///main_module.js".to_string(),
             module_url_found: "file:///main_module.js".to_string(),
-            code: b"if (!import.meta.main) throw Error();"
-              .to_vec()
-              .into_boxed_slice(),
+            code: b"if (!import.meta.main) throw Error();".as_slice().into(),
             module_type: ModuleType::JavaScript,
           }),
           "file:///side_module.js" => Ok(ModuleSource {
             module_url_specified: "file:///side_module.js".to_string(),
             module_url_found: "file:///side_module.js".to_string(),
-            code: b"if (import.meta.main) throw Error();"
-              .to_vec()
-              .into_boxed_slice(),
+            code: b"if (import.meta.main) throw Error();".as_slice().into(),
             module_type: ModuleType::JavaScript,
           }),
           _ => unreachable!(),

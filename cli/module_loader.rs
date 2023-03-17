@@ -208,7 +208,7 @@ impl CliModuleLoader {
       code_without_source_map(code_source.code)
     };
     Ok(ModuleSource {
-      code: code.into_bytes().into_boxed_slice(),
+      code: code.into(),
       module_url_specified: specifier.to_string(),
       module_url_found: code_source.found_url.to_string(),
       module_type: match code_source.media_type {

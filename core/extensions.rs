@@ -2,6 +2,7 @@
 use crate::OpState;
 use anyhow::Context as _;
 use anyhow::Error;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -23,13 +24,15 @@ pub enum ExtensionFileSourceCode {
 }
 
 impl ExtensionFileSourceCode {
-  pub fn load(&self) -> Result<String, Error> {
+  pub fn load(&self) -> Result<Cow<'static, str>, Error> {
     match self {
-      ExtensionFileSourceCode::IncludedInBinary(code) => Ok(code.to_string()),
+      ExtensionFileSourceCode::IncludedInBinary(code) => {
+        Ok(Cow::Borrowed(code))
+      }
       ExtensionFileSourceCode::LoadedFromFsDuringSnapshot(path) => {
         let msg = format!("Failed to read \"{}\"", path.display());
         let code = std::fs::read_to_string(path).context(msg)?;
-        Ok(code)
+        Ok(Cow::Owned(code))
       }
     }
   }
