@@ -4162,7 +4162,7 @@ Deno.core.opAsync("op_async_serialize_object_with_numbers_as_keys", {
       ) -> Pin<Box<ModuleSourceFuture>> {
         async move {
           Ok(ModuleSource {
-            code: b"console.log('hello world');".to_vec().into_boxed_slice(),
+            code: b"console.log('hello world');".as_slice().into(),
             module_url_specified: "file:///main.js".to_string(),
             module_url_found: "file:///main.js".to_string(),
             module_type: ModuleType::JavaScript,
@@ -4343,7 +4343,7 @@ Deno.core.opAsync("op_async_serialize_object_with_numbers_as_keys", {
 
         async move {
           Ok(ModuleSource {
-            code: source.as_bytes().to_vec().into_boxed_slice(),
+            code: source.into(),
             module_url_specified: "file:///main.js".to_string(),
             module_url_found: "file:///main.js".to_string(),
             module_type: ModuleType::JavaScript,
@@ -4851,7 +4851,7 @@ Deno.core.opAsync("op_async_serialize_object_with_numbers_as_keys", {
 
         async move {
           Ok(ModuleSource {
-            code: source.as_bytes().to_vec().into_boxed_slice(),
+            code: source.into(),
             module_url_specified: "file:///main.js".to_string(),
             module_url_found: "file:///main.js".to_string(),
             module_type: ModuleType::JavaScript,
