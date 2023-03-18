@@ -833,14 +833,14 @@ pub fn exec(request: Request) -> Result<Response, AnyError> {
       root_map: HashMap<String, Url>,
       remapped_specifiers: HashMap<String, Url>,
     },
-    state = |state, options| {
+    state = |state, request, root_map, remapped_specifiers| {
       state.put(State::new(
-        options.request.graph,
-        options.request.hash_data,
-        options.request.maybe_npm_resolver,
-        options.request.maybe_tsbuildinfo,
-        options.root_map,
-        options.remapped_specifiers,
+        request.graph,
+        request.hash_data,
+        request.maybe_npm_resolver,
+        request.maybe_tsbuildinfo,
+        root_map,
+        remapped_specifiers,
         std::env::current_dir()
           .context("Unable to get CWD")
           .unwrap(),

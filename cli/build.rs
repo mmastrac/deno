@@ -125,10 +125,10 @@ mod ts {
       build_libs: Vec<&'static str>,
       path_dts: PathBuf,
     },
-    state = |state, options| {
-      state.put(options.op_crate_libs);
-      state.put(options.build_libs);
-      state.put(options.path_dts);
+    state = |state, op_crate_libs, build_libs, path_dts| {
+      state.put(op_crate_libs);
+      state.put(build_libs);
+      state.put(path_dts);
     },
   );
 

@@ -2735,10 +2735,10 @@ pub mod tests {
         mode: Mode,
         dispatch_count: Arc<AtomicUsize>,
       },
-      state = |state, options| {
+      state = |state, mode, dispatch_count| {
         state.put(TestState {
-          mode: options.mode,
-          dispatch_count: options.dispatch_count
+          mode: mode,
+          dispatch_count: dispatch_count
         })
       }
     );

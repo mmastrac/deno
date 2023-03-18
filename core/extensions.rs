@@ -294,12 +294,12 @@ macro_rules! extension {
       }
 
       impl $( <  $( $param : $type + 'static ),+ > )? Config $( <  $( $param ),+ > )? {
-        /// Call a function of |state, cfg| using this configuration structure.
+        /// Call a function of |state, ...| using the fields of this configuration structure.
         #[allow(dead_code)]
         #[doc(hidden)]
         #[inline(always)]
-        fn call_callback<F: Fn(&mut $crate::OpState, Self)>(self, state: &mut $crate::OpState, f: F) {
-          f(state, self)
+        fn call_callback<F: Fn(&mut $crate::OpState, $( $options_type ),*)>(self, state: &mut $crate::OpState, f: F) {
+          f(state, $( self. $options_id ),* )
         }
       }
 

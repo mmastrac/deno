@@ -1562,8 +1562,8 @@ deno_core::extension!(deno_flash,
   options = {
     unstable: bool,
   },
-  state = |state, options| {
-    state.put(Unstable(options.unstable));
+  state = |state, unstable| {
+    state.put(Unstable(unstable));
     state.put(FlashContext {
       next_server_id: 0,
       join_handles: HashMap::default(),

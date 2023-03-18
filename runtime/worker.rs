@@ -193,10 +193,10 @@ impl MainWorker {
         unstable: bool,
         enable_testing_features: bool,
       },
-      state = |state, options| {
-        state.put::<PermissionsContainer>(options.permissions);
-        state.put(ops::UnstableChecker { unstable: options.unstable });
-        state.put(ops::TestingFeaturesEnabled(options.enable_testing_features));
+      state = |state, permissions, unstable, enable_testing_features| {
+        state.put::<PermissionsContainer>(permissions);
+        state.put(ops::UnstableChecker { unstable });
+        state.put(ops::TestingFeaturesEnabled(enable_testing_features));
       },
     );
 

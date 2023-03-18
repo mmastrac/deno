@@ -511,12 +511,12 @@ deno_core::extension!(deno_websocket,
     root_cert_store: Option<RootCertStore>,
     unsafely_ignore_certificate_errors: Option<Vec<String>>
   },
-  state = |state, options| {
-    state.put::<WsUserAgent>(WsUserAgent(options.user_agent));
+  state = |state, user_agent, root_cert_store, unsafely_ignore_certificate_errors| {
+    state.put::<WsUserAgent>(WsUserAgent(user_agent));
     state.put(UnsafelyIgnoreCertificateErrors(
-      options.unsafely_ignore_certificate_errors,
+      unsafely_ignore_certificate_errors,
     ));
-    state.put::<WsRootStore>(WsRootStore(options.root_cert_store));
+    state.put::<WsRootStore>(WsRootStore(root_cert_store));
   },
 );
 
