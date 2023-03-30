@@ -20,15 +20,13 @@ use v8::NewStringType;
 /// let code: ModuleCode = "a string".into();
 /// let code: ModuleCode = b"a string".into();
 /// ```
+#[derive(Clone)]
 pub enum FastString {
   /// Created from static data.
   Static(&'static str),
 
   /// Created from static data, known to contain only ASCII chars.
   StaticAscii(&'static str),
-
-  /// An owned chunk of data.
-  Owned(Box<str>),
 
   // Scripts loaded from the `deno_graph` infrastructure.
   Arc(Arc<str>),
@@ -77,21 +75,8 @@ impl FastString {
   pub fn from_ownable(s: impl IsPotentiallyOwned) -> Self {
     let s = s.maybe_into_owned_vec();
     match s {
-      Cow::Owned(s) => Self::Owned(s.into_boxed_str()),
+      Cow::Owned(s) => Self::Arc(s.into_boxed_str().into()),
       Cow::Borrowed(s) => Self::from_static(s),
-    }
-  }
-
-  pub fn into_cheap_copy(self) -> (Self, Self) {
-    match self {
-      Self::Static(s) => (Self::Static(s), Self::Static(s)),
-      Self::StaticAscii(s) => (Self::StaticAscii(s), Self::StaticAscii(s)),
-      Self::Arc(s) => (Self::Arc(s.clone()), Self::Arc(s)),
-      Self::Owned(s) => {
-        let s: Arc<str> = s.into();
-        (Self::Arc(s.clone()), Self::Arc(s))
-        // (Self::Owned(s.clone()), Self::Owned(s))
-      }
     }
   }
 
@@ -110,7 +95,6 @@ impl FastString {
     // TODO(mmastrac): This can be const eventually
     match self {
       Self::Arc(s) => s.as_bytes(),
-      Self::Owned(s) => s.as_bytes(),
       Self::Static(s) => s.as_bytes(),
       Self::StaticAscii(s) => s.as_bytes(),
     }
@@ -120,7 +104,6 @@ impl FastString {
     // TODO(mmastrac): This can be const eventually
     match self {
       Self::Arc(s) => s,
-      Self::Owned(s) => s,
       Self::Static(s) => s,
       Self::StaticAscii(s) => s,
     }
@@ -144,7 +127,6 @@ impl FastString {
     match self {
       Self::Static(b) => *self = Self::Static(&b[..index]),
       Self::StaticAscii(b) => *self = Self::StaticAscii(&b[..index]),
-      Self::Owned(b) => *self = Self::Owned(b[..index].to_owned().into()),
       // We can't do much if we have an Arc<str>, so we'll just take ownership of the truncated version
       Self::Arc(s) => *self = s[..index].to_owned().into(),
     }
@@ -189,14 +171,6 @@ impl PartialEq for FastString {
 
 impl Eq for FastString {}
 
-// /// [`FastString`] can be make cheaply from [`Vec`] as we know it's owned and don't need to do an
-// /// ASCII check.
-// impl From<Vec<u8>> for FastString {
-//   fn from(value: Vec<u8>) -> Self {
-//       FastString::Owned(value)
-//   }
-// }
-
 /// [`FastString`] can be make cheaply from [`Url`] as we know it's owned and don't need to do an
 /// ASCII check.
 impl From<Url> for FastString {
@@ -210,7 +184,7 @@ impl From<Url> for FastString {
 /// ASCII check.
 impl From<String> for FastString {
   fn from(value: String) -> Self {
-    FastString::Owned(value.into_boxed_str())
+    FastString::Arc(value.into_boxed_str().into())
   }
 }
 

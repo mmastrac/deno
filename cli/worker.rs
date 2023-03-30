@@ -232,7 +232,7 @@ impl CliMainWorker {
 
     self.worker.execute_script(
       located_script_name!(),
-      fast!("Deno[Deno.internal].core.enableOpCallTracing();"),
+      &fast!("Deno[Deno.internal].core.enableOpCallTracing();"),
     )?;
 
     if mode != TestMode::Documentation {

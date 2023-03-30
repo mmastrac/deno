@@ -447,7 +447,7 @@ pub fn initialize_runtime(
     argv0
   );
 
-  js_runtime.execute_script(located_script_name!(), source_code.into())?;
+  js_runtime.execute_script(located_script_name!(), &source_code.into())?;
   Ok(())
 }
 
@@ -471,6 +471,6 @@ pub fn load_cjs_module(
   )
   .into();
 
-  js_runtime.execute_script(located_script_name!(), source_code)?;
+  js_runtime.execute_script(located_script_name!(), &source_code)?;
   Ok(())
 }

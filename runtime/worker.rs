@@ -375,7 +375,7 @@ impl MainWorker {
   pub fn execute_script(
     &mut self,
     script_name: &'static str,
-    source_code: ModuleCode,
+    source_code: &ModuleCode,
   ) -> Result<v8::Global<v8::Value>, AnyError> {
     self.js_runtime.execute_script(script_name, source_code)
   }
@@ -517,7 +517,7 @@ impl MainWorker {
       // NOTE(@bartlomieju): not using `globalThis` here, because user might delete
       // it. Instead we're using global `dispatchEvent` function which will
       // used a saved reference to global scope.
-      fast!("dispatchEvent(new Event('load'))"),
+      &fast!("dispatchEvent(new Event('load'))"),
     )?;
     Ok(())
   }
@@ -534,7 +534,7 @@ impl MainWorker {
       // NOTE(@bartlomieju): not using `globalThis` here, because user might delete
       // it. Instead we're using global `dispatchEvent` function which will
       // used a saved reference to global scope.
-      fast!("dispatchEvent(new Event('unload'))"),
+      &fast!("dispatchEvent(new Event('unload'))"),
     )?;
     Ok(())
   }
@@ -551,7 +551,7 @@ impl MainWorker {
       // NOTE(@bartlomieju): not using `globalThis` here, because user might delete
       // it. Instead we're using global `dispatchEvent` function which will
       // used a saved reference to global scope.
-      fast!("dispatchEvent(new Event('beforeunload', { cancelable: true }));"),
+      &fast!("dispatchEvent(new Event('beforeunload', { cancelable: true }));"),
     )?;
     let local_value = value.open(&mut self.js_runtime.handle_scope());
     Ok(local_value.is_false())

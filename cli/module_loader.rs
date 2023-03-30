@@ -270,7 +270,6 @@ impl ModuleLoader for CliModuleLoader {
       return Box::pin(deno_core::futures::future::ready(Ok(())));
     }
 
-    let specifier = specifier.clone();
     let ps = self.ps.clone();
 
     let dynamic_permissions = self.dynamic_permissions.clone();

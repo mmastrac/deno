@@ -750,7 +750,7 @@ impl JsRuntime {
             realm.execute_script(
               self.v8_isolate(),
               file_source.specifier,
-              file_source.load()?,
+              &file_source.load()?,
             )?;
           }
         }
@@ -916,7 +916,7 @@ impl JsRuntime {
   pub fn execute_script(
     &mut self,
     name: &'static str,
-    source_code: ModuleCode,
+    source_code: &ModuleCode,
   ) -> Result<v8::Global<v8::Value>, Error> {
     self
       .global_realm()
@@ -945,7 +945,7 @@ impl JsRuntime {
     self.global_realm().execute_script(
       self.v8_isolate(),
       name,
-      ModuleCode::from_static(source_code),
+      &ModuleCode::from_static(source_code),
     )
   }
 
@@ -2095,13 +2095,13 @@ impl JsRuntime {
     code: Option<ModuleCode>,
   ) -> Result<ModuleId, Error> {
     let module_map_rc = Self::module_map(self.v8_isolate());
+    let specifier = specifier.into();
     if let Some(code) = code {
-      let specifier = specifier.clone().into();
       let scope = &mut self.handle_scope();
       // true for main module
       module_map_rc
         .borrow_mut()
-        .new_es_module(scope, true, specifier, code, false)
+        .new_es_module(scope, true, &specifier, &code, false)
         .map_err(|e| match e {
           ModuleError::Exception(exception) => {
             let exception = v8::Local::new(scope, exception);
@@ -2112,7 +2112,7 @@ impl JsRuntime {
     }
 
     let mut load =
-      ModuleMap::load_main(module_map_rc.clone(), &specifier.into()).await?;
+      ModuleMap::load_main(module_map_rc.clone(), &specifier).await?;
 
     while let Some(load_result) = load.next().await {
       let (request, info) = load_result?;
@@ -2156,7 +2156,7 @@ impl JsRuntime {
       // false for side module (not main module)
       module_map_rc
         .borrow_mut()
-        .new_es_module(scope, false, specifier, code, false)
+        .new_es_module(scope, false, &specifier, &code, false)
         .map_err(|e| match e {
           ModuleError::Exception(exception) => {
             let exception = v8::Local::new(scope, exception);
@@ -2558,7 +2558,7 @@ impl JsRealm {
     name: &'static str,
     source_code: &'static str,
   ) -> Result<v8::Global<v8::Value>, Error> {
-    self.execute_script(isolate, name, ModuleCode::from_static(source_code))
+    self.execute_script(isolate, name, &ModuleCode::from_static(source_code))
   }
 
   /// Executes traditional JavaScript code (traditional = not ES modules) in the
@@ -2579,11 +2579,11 @@ impl JsRealm {
     &self,
     isolate: &mut v8::Isolate,
     name: &'static str,
-    source_code: ModuleCode,
+    source_code: &ModuleCode,
   ) -> Result<v8::Global<v8::Value>, Error> {
     let scope = &mut self.handle_scope(isolate);
 
-    let source = Self::string_from_code(scope, &source_code).unwrap();
+    let source = Self::string_from_code(scope, source_code).unwrap();
     debug_assert!(name.is_ascii());
     let name =
       v8::String::new_external_onebyte_static(scope, name.as_bytes()).unwrap();
@@ -3198,7 +3198,7 @@ pub mod tests {
       runtime
         .execute_script(
           "encode_decode_test.js",
-          include_fast_string!("encode_decode_test.js"),
+          &include_fast_string!("encode_decode_test.js"),
         )
         .unwrap();
       if let Poll::Ready(Err(_)) = runtime.poll_event_loop(cx, false) {
@@ -3214,7 +3214,7 @@ pub mod tests {
       runtime
         .execute_script(
           "serialize_deserialize_test.js",
-          include_fast_string!("serialize_deserialize_test.js"),
+          &include_fast_string!("serialize_deserialize_test.js"),
         )
         .unwrap();
       if let Poll::Ready(Err(_)) = runtime.poll_event_loop(cx, false) {
@@ -4376,7 +4376,7 @@ Deno.core.opAsync("op_async_serialize_object_with_numbers_as_keys", {
         .execute_script(
           runtime.v8_isolate(),
           "",
-          format!(
+          &format!(
             r#"
               
               globalThis.rejectValue = undefined;

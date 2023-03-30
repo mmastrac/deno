@@ -788,14 +788,12 @@ impl RecursiveModuleLoad {
     // Register the module in the module map unless it's already there. If the
     // specified URL and the "true" URL are different, register the alias.
     let module_url_found = if let Some(module_url_found) = module_url_found {
-      let (module_url_found1, module_url_found2) =
-        module_url_found.into_cheap_copy();
       self.module_map_rc.borrow_mut().alias(
         module_url_specified,
         expected_asserted_module_type,
-        module_url_found1,
+        module_url_found.clone(),
       );
-      module_url_found2
+      module_url_found
     } else {
       module_url_specified
     };
@@ -817,15 +815,15 @@ impl RecursiveModuleLoad {
           self.module_map_rc.borrow_mut().new_es_module(
             scope,
             self.is_currently_loading_main_module(),
-            module_url_found,
-            module_source.code,
+            &module_url_found,
+            &module_source.code,
             self.is_dynamic_import(),
           )?
         }
         ModuleType::Json => self.module_map_rc.borrow_mut().new_json_module(
           scope,
-          module_url_found,
-          module_source.code,
+          &module_url_found,
+          &module_source.code,
         )?,
       },
     };
@@ -1376,8 +1374,8 @@ impl ModuleMap {
   fn new_json_module(
     &mut self,
     scope: &mut v8::HandleScope,
-    name: ModuleName,
-    source: ModuleCode,
+    name: &ModuleName,
+    source: &ModuleCode,
   ) -> Result<ModuleId, ModuleError> {
     let name_str = name.v8(scope);
     let source_str = v8::String::new_from_utf8(
@@ -1411,8 +1409,13 @@ impl ModuleMap {
     let value_handle = v8::Global::<v8::Value>::new(tc_scope, parsed_json);
     self.json_value_store.insert(handle.clone(), value_handle);
 
-    let id =
-      self.create_module_info(name, ModuleType::Json, handle, false, vec![]);
+    let id = self.create_module_info(
+      name.clone(),
+      ModuleType::Json,
+      handle,
+      false,
+      vec![],
+    );
 
     Ok(id)
   }
@@ -1422,8 +1425,8 @@ impl ModuleMap {
     &mut self,
     scope: &mut v8::HandleScope,
     main: bool,
-    name: ModuleName,
-    source: ModuleCode,
+    name: &ModuleName,
+    source: &ModuleCode,
     is_dynamic_import: bool,
   ) -> Result<ModuleId, ModuleError> {
     let name_str = name.v8(scope);
@@ -1509,7 +1512,7 @@ impl ModuleMap {
 
     let handle = v8::Global::<v8::Module>::new(tc_scope, module);
     let id = self.create_module_info(
-      name,
+      name.clone(),
       ModuleType::JavaScript,
       handle,
       main,
@@ -1528,15 +1531,14 @@ impl ModuleMap {
     requests: Vec<ModuleRequest>,
   ) -> ModuleId {
     let id = self.handles.len();
-    let (name1, name2) = name.into_cheap_copy();
     self
       .by_name_mut(module_type.into())
-      .insert(name1, SymbolicModule::Mod(id));
+      .insert(name.clone(), SymbolicModule::Mod(id));
     self.handles.push(handle);
     self.info.push(ModuleInfo {
       id,
       main,
-      name: name2,
+      name,
       requests,
       module_type,
     });
@@ -2109,8 +2111,8 @@ import "/a.js";
         .new_es_module(
           scope,
           true,
-          specifier_a,
-          fast!(
+          &specifier_a,
+          &fast!(
             r#"
           import { b } from './b.js'
           if (b() != 'b') throw Error();
@@ -2136,8 +2138,8 @@ import "/a.js";
         .new_es_module(
           scope,
           false,
-          fast!("file:///b.js"),
-          fast!("export function b() { return 'b' }"),
+          &fast!("file:///b.js"),
+          &fast!("export function b() { return 'b' }"),
           false,
         )
         .unwrap();
@@ -2221,8 +2223,8 @@ import "/a.js";
         .new_es_module(
           scope,
           true,
-          specifier_a,
-          fast!(
+          &specifier_a,
+          &fast!(
             r#"
             import jsonData from './b.json' assert {type: "json"};
             assert(jsonData.a == "b");
@@ -2245,8 +2247,8 @@ import "/a.js";
       let mod_b = module_map
         .new_json_module(
           scope,
-          fast!("file:///b.json"),
-          fast!("{\"a\": \"b\", \"c\": {\"d\": 10}}"),
+          &fast!("file:///b.json"),
+          &fast!("{\"a\": \"b\", \"c\": {\"d\": 10}}"),
         )
         .unwrap();
       let imports = module_map.get_requested_modules(mod_b).unwrap();

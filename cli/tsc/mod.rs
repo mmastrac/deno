@@ -131,8 +131,8 @@ fn get_asset_texts_from_new_runtime() -> Result<Vec<AssetText>, AnyError> {
     extensions: vec![deno_cli_tsc::init_ops()],
     ..Default::default()
   });
-  let global =
-    runtime.execute_script("get_assets.js", fast!("globalThis.getAssets()"))?;
+  let global = runtime
+    .execute_script("get_assets.js", &fast!("globalThis.getAssets()"))?;
   let scope = &mut runtime.handle_scope();
   let local = deno_core::v8::Local::new(scope, global);
   Ok(serde_v8::from_v8::<Vec<AssetText>>(scope, local)?)
@@ -804,14 +804,14 @@ pub fn exec(request: Request) -> Result<Response, AnyError> {
     },
   );
 
-  let startup_source = fast!("globalThis.startup({ legacyFlag: false })");
+  let startup_source = &fast!("globalThis.startup({ legacyFlag: false })");
   let request_value = json!({
     "config": request.config,
     "debug": request.debug,
     "rootNames": root_names,
     "localOnly": request.check_mode == TypeCheckMode::Local,
   });
-  let exec_source = format!("globalThis.exec({request_value})").into();
+  let exec_source = &format!("globalThis.exec({request_value})").into();
 
   let mut runtime = JsRuntime::new(RuntimeOptions {
     startup_snapshot: Some(compiler_snapshot()),
