@@ -7,18 +7,18 @@ use std::sync::Arc;
 use url::Url;
 use v8::NewStringType;
 
-/// Module code can be sourced from strings or bytes that are either owned or borrowed. This enumeration allows us
+/// Module names and code can be sourced from strings or bytes that are either owned or borrowed. This enumeration allows us
 /// to perform a minimal amount of cloning and format-shifting of the underlying data.
 ///
-/// Note that any [`ModuleCode`] created from a `'static` byte array or string must contain ASCII characters.
+/// Note that any [`FastString`] created from a `'static` byte array or string must contain ASCII characters.
 ///
-/// Examples of ways to construct a [`ModuleCode`] object:
+/// Examples of ways to construct a [`FastString`]:
 ///
 /// ```rust
-/// # use deno_core::ModuleCode;
+/// # use deno_core::{fast, FastString};
 ///
-/// let code: ModuleCode = "a string".into();
-/// let code: ModuleCode = b"a string".into();
+/// let code: FastString = fast!("a string");
+/// let code: FastString = format!("a string").into();
 /// ```
 #[derive(Clone)]
 pub enum FastString {
@@ -43,7 +43,7 @@ impl IsPotentiallyOwned for String {
 }
 
 impl FastString {
-  /// Compiler-time function to determine if a string is ASCII. Note that UTF-8 chars
+  /// Compile-time function to determine if a string is ASCII. Note that UTF-8 chars
   /// longer than one byte have the high-bit set and thus, are not ASCII.
   const fn is_ascii(s: &'static [u8]) -> bool {
     let mut i = 0;
@@ -56,6 +56,8 @@ impl FastString {
     true
   }
 
+  /// Create a [`FastString`] from a static string. The string may contain non-ASCII characters, and if
+  /// so, will take the slower path when used in v8.
   pub const fn from_static(s: &'static str) -> Self {
     if Self::is_ascii(s.as_bytes()) {
       Self::StaticAscii(s)
@@ -64,6 +66,8 @@ impl FastString {
     }
   }
 
+  /// Create a [`FastString`] from a static string. If the string contains non-ASCII characters, the compiler
+  /// will abort.
   pub const fn ensure_static_ascii(s: &'static str) -> Self {
     if Self::is_ascii(s.as_bytes()) {
       Self::StaticAscii(s)
@@ -109,6 +113,8 @@ impl FastString {
     }
   }
 
+  /// Create a v8 string from this [`FastString`]. If the string is static and contains only ASCII characters,
+  /// an external one-byte static is created.
   pub fn v8<'a>(
     &self,
     scope: &mut v8::HandleScope<'a>,
@@ -188,7 +194,8 @@ impl From<String> for FastString {
   }
 }
 
-/// Include a fast string in the binary.
+/// Include a fast string in the binary. This string is asserted at compile-time to be 7-bit ASCII for optimal
+/// v8 performance.
 #[macro_export]
 macro_rules! include_fast_string {
   ($file:literal) => {
@@ -196,6 +203,8 @@ macro_rules! include_fast_string {
   };
 }
 
+/// Include a fast string in the binary from a string literal. This string is asserted at compile-time to be 
+/// 7-bit ASCII for optimal v8 performance.
 #[macro_export]
 macro_rules! fast {
   ($str:literal) => {
