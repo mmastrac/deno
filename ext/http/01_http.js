@@ -39,6 +39,7 @@ import {
   getReadableStreamResourceBacking,
   readableStreamClose,
   readableStreamForRid,
+  writableStreamForRid,
   ReadableStreamPrototype,
 } from "ext:deno_web/06_streams.js";
 const {
@@ -49,6 +50,7 @@ const {
   ObjectPrototypeIsPrototypeOf,
   PromisePrototypeCatch,
   SafeSet,
+  ObjectEntries,
   SafeSetIterator,
   SetPrototypeAdd,
   SetPrototypeDelete,
@@ -73,104 +75,101 @@ class HttpConn {
   #closed = false;
   #remoteAddr;
   #localAddr;
-
-  // This set holds resource ids of resources
-  // that were created during lifecycle of this request.
-  // When the connection is closed these resources should be closed
-  // as well.
-  managedResources = new SafeSet();
+  #connections;
+  #waiters;
+  #httpRid;
+  #requests;
+  #error;
+  #closePromise;
+  #closeResolve;
 
   constructor(rid, remoteAddr, localAddr) {
-    this.#rid = rid;
     this.#remoteAddr = remoteAddr;
     this.#localAddr = localAddr;
+    this.#connections = [];
+    this.#waiters = [];
+    this.#requests = new Set();
+    this.#closePromise = new Promise(r => this.#closeResolve = r);
+
+    const connections = this.#connections;
+    const waiters = this.#waiters;
+    const context = new CallbackContext();
+    const onError = this.#onError.bind(this);
+
+    this.#httpRid = core.ops.op_serve_http_on(rid, context.initialize.bind(context), map_to_userland(this.#requests, context, (req, responsePromise) => {
+      const promise = new Promise(r => {
+        connections.push([r, req, responsePromise]);
+        waiters.pop()?.(true);
+      });
+      return promise;
+    }, true, onError));
+    context.server_rid = this.#httpRid;
+
+    // Start the async IIFE to avoid looking like the event loop stalled
+    const httpRid = this.#httpRid;
+    // TODO(mmastrac): This IIFE should be the close promise
+    (async () => {
+      try {
+        await core.opAsync("op_http_wait", httpRid);
+      } catch (e) {
+        // TODO(mmastrac): Is this the right way to get the exception?
+        onError(new Deno.errors.Http(e.message));
+      } finally {
+        // TODO(mmastrac): We might want to consider using close here
+        for (const waiter of this.#waiters) {
+          waiter(false);
+        }
+        this.#onError(new TypeError("closed"));
+        this.#closeResolve()
+      }
+    })()
   }
 
-  /** @returns {number} */
-  get rid() {
-    return this.#rid;
+  #onError(e) {
+    // Only keep the first exception
+    if (!this.#error) {
+      this.#error = e;
+    }
+    // Wake any waiters so they throw the exception
+    for (const waiter of this.#waiters) {
+      waiter(true);
+    }           
   }
 
   /** @returns {Promise<RequestEvent | null>} */
   async nextRequest() {
-    let nextRequest;
-    try {
-      nextRequest = await core.opAsync("op_http_accept", this.#rid);
-    } catch (error) {
-      this.close();
-      // A connection error seen here would cause disrupted responses to throw
-      // a generic `BadResource` error. Instead store this error and replace
-      // those with it.
-      this[connErrorSymbol] = error;
-      if (
-        ObjectPrototypeIsPrototypeOf(BadResourcePrototype, error) ||
-        ObjectPrototypeIsPrototypeOf(InterruptedPrototype, error) ||
-        StringPrototypeIncludes(error.message, "connection closed")
-      ) {
+    while (true) {
+      if (this.#error) {
+        throw this.#error;
+      }
+      const conn = this.#connections.pop();
+      if (conn) {
+        return { request: conn[1], respondWith: (resp) => { 
+          conn[0](resp);
+          // Return a promise tracking the state of the response
+          return conn[2]();
+        } };
+      }
+      const wakeup = new Promise(r => this.#waiters.push(r));
+      if (await wakeup === false) {
         return null;
       }
-      throw error;
     }
-    if (nextRequest == null) {
-      // Work-around for servers (deno_std/http in particular) that call
-      // `nextRequest()` before upgrading a previous request which has a
-      // `connection: upgrade` header.
-      await null;
-
-      this.close();
-      return null;
-    }
-
-    const { 0: streamRid, 1: method, 2: url } = nextRequest;
-    SetPrototypeAdd(this.managedResources, streamRid);
-
-    /** @type {ReadableStream<Uint8Array> | undefined} */
-    let body = null;
-    // There might be a body, but we don't expose it for GET/HEAD requests.
-    // It will be closed automatically once the request has been handled and
-    // the response has been sent.
-    if (method !== "GET" && method !== "HEAD") {
-      body = readableStreamForRid(streamRid, false);
-    }
-
-    const innerRequest = newInnerRequest(
-      method,
-      url,
-      () => ops.op_http_headers(streamRid),
-      body !== null ? new InnerBody(body) : null,
-      false,
-    );
-    innerRequest[streamRid] = streamRid;
-    const abortController = new AbortController();
-    const request = fromInnerRequest(
-      innerRequest,
-      abortController.signal,
-      "immutable",
-      false,
-    );
-
-    const respondWith = createRespondWith(
-      this,
-      streamRid,
-      request,
-      this.#remoteAddr,
-      this.#localAddr,
-      abortController,
-    );
-
-    return { request, respondWith };
   }
 
   /** @returns {void} */
-  close() {
-    if (!this.#closed) {
-      this.#closed = true;
-      core.close(this.#rid);
-      for (const rid of new SafeSetIterator(this.managedResources)) {
-        SetPrototypeDelete(this.managedResources, rid);
-        core.close(rid);
-      }
+  async close() {
+    for (const waiter of this.#waiters) {
+      waiter(false);
     }
+    for (const request of this.#requests) {
+      request.close();
+    }
+    this.#requests = new Set();
+    // Don't allow further listening
+    this.#onError(new TypeError("closed"));
+    core.tryClose(this.#httpRid);
+    await this.#closePromise;
   }
 
   [SymbolAsyncIterator]() {
@@ -186,437 +185,396 @@ class HttpConn {
   }
 }
 
-function createRespondWith(
-  httpConn,
-  streamRid,
-  request,
-  remoteAddr,
-  localAddr,
-  abortController,
-) {
-  return async function respondWith(resp) {
-    try {
-      resp = await resp;
-      if (!(ObjectPrototypeIsPrototypeOf(ResponsePrototype, resp))) {
-        throw new TypeError(
-          "First argument to respondWith must be a Response or a promise resolving to a Response.",
-        );
-      }
-
-      const innerResp = toInnerResponse(resp);
-
-      // If response body length is known, it will be sent synchronously in a
-      // single op, in other case a "response body" resource will be created and
-      // we'll be streaming it.
-      /** @type {ReadableStream<Uint8Array> | Uint8Array | null} */
-      let respBody = null;
-      if (innerResp.body !== null) {
-        if (innerResp.body.unusable()) {
-          throw new TypeError("Body is unusable.");
-        }
-        if (
-          ObjectPrototypeIsPrototypeOf(
-            ReadableStreamPrototype,
-            innerResp.body.streamOrStatic,
-          )
-        ) {
-          if (
-            innerResp.body.length === null ||
-            ObjectPrototypeIsPrototypeOf(
-              BlobPrototype,
-              innerResp.body.source,
-            )
-          ) {
-            respBody = innerResp.body.stream;
-          } else {
-            const reader = innerResp.body.stream.getReader();
-            const r1 = await reader.read();
-            if (r1.done) {
-              respBody = new Uint8Array(0);
-            } else {
-              respBody = r1.value;
-              const r2 = await reader.read();
-              if (!r2.done) throw new TypeError("Unreachable");
-            }
-          }
-        } else {
-          innerResp.body.streamOrStatic.consumed = true;
-          respBody = innerResp.body.streamOrStatic.body;
-        }
-      } else {
-        respBody = new Uint8Array(0);
-      }
-      const isStreamingResponseBody = !(
-        typeof respBody === "string" ||
-        ObjectPrototypeIsPrototypeOf(Uint8ArrayPrototype, respBody)
-      );
-      try {
-        await core.opAsync(
-          "op_http_write_headers",
-          streamRid,
-          innerResp.status ?? 200,
-          innerResp.headerList,
-          isStreamingResponseBody ? null : respBody,
-        );
-      } catch (error) {
-        const connError = httpConn[connErrorSymbol];
-        if (
-          ObjectPrototypeIsPrototypeOf(BadResourcePrototype, error) &&
-          connError != null
-        ) {
-          // deno-lint-ignore no-ex-assign
-          error = new connError.constructor(connError.message);
-        }
-        if (
-          respBody !== null &&
-          ObjectPrototypeIsPrototypeOf(ReadableStreamPrototype, respBody)
-        ) {
-          await respBody.cancel(error);
-        }
-        throw error;
-      }
-
-      if (isStreamingResponseBody) {
-        let success = false;
-        if (
-          respBody === null ||
-          !ObjectPrototypeIsPrototypeOf(ReadableStreamPrototype, respBody)
-        ) {
-          throw new TypeError("Unreachable");
-        }
-        const resourceBacking = getReadableStreamResourceBacking(respBody);
-        let reader;
-        if (resourceBacking) {
-          if (respBody.locked) {
-            throw new TypeError("ReadableStream is locked.");
-          }
-          reader = respBody.getReader(); // Aquire JS lock.
-          try {
-            await core.opAsync(
-              "op_http_write_resource",
-              streamRid,
-              resourceBacking.rid,
-            );
-            if (resourceBacking.autoClose) core.tryClose(resourceBacking.rid);
-            readableStreamClose(respBody); // Release JS lock.
-            success = true;
-          } catch (error) {
-            const connError = httpConn[connErrorSymbol];
-            if (
-              ObjectPrototypeIsPrototypeOf(BadResourcePrototype, error) &&
-              connError != null
-            ) {
-              // deno-lint-ignore no-ex-assign
-              error = new connError.constructor(connError.message);
-            }
-            await reader.cancel(error);
-            throw error;
-          }
-        } else {
-          reader = respBody.getReader();
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            if (!ObjectPrototypeIsPrototypeOf(Uint8ArrayPrototype, value)) {
-              await reader.cancel(new TypeError("Value not a Uint8Array"));
-              break;
-            }
-            try {
-              await core.opAsync2("op_http_write", streamRid, value);
-            } catch (error) {
-              const connError = httpConn[connErrorSymbol];
-              if (
-                ObjectPrototypeIsPrototypeOf(BadResourcePrototype, error) &&
-                connError != null
-              ) {
-                // deno-lint-ignore no-ex-assign
-                error = new connError.constructor(connError.message);
-              }
-              await reader.cancel(error);
-              throw error;
-            }
-          }
-          success = true;
-        }
-
-        if (success) {
-          try {
-            await core.opAsync("op_http_shutdown", streamRid);
-          } catch (error) {
-            await reader.cancel(error);
-            throw error;
-          }
-        }
-      }
-
-      const deferred = request[_deferred];
-      if (deferred) {
-        const res = await core.opAsync("op_http_upgrade", streamRid);
-        let conn;
-        if (res.connType === "tcp") {
-          conn = new TcpConn(res.connRid, remoteAddr, localAddr);
-        } else if (res.connType === "tls") {
-          conn = new TlsConn(res.connRid, remoteAddr, localAddr);
-        } else if (res.connType === "unix") {
-          conn = new UnixConn(res.connRid, remoteAddr, localAddr);
-        } else {
-          throw new Error("unreachable");
-        }
-
-        deferred.resolve([conn, res.readBuf]);
-      }
-      const ws = resp[_ws];
-      if (ws) {
-        const wsRid = await core.opAsync(
-          "op_http_upgrade_websocket",
-          streamRid,
-        );
-        ws[_rid] = wsRid;
-        ws[_protocol] = resp.headers.get("sec-websocket-protocol");
-
-        httpConn.close();
-
-        ws[_readyState] = WebSocket.OPEN;
-        ws[_role] = SERVER;
-        const event = new Event("open");
-        ws.dispatchEvent(event);
-
-        ws[_eventLoop]();
-        if (ws[_idleTimeoutDuration]) {
-          ws.addEventListener(
-            "close",
-            () => clearTimeout(ws[_idleTimeoutTimeout]),
-          );
-        }
-        ws[_serverHandleIdleTimeout]();
-      }
-    } catch (error) {
-      abortController.abort(error);
-      throw error;
-    } finally {
-      if (SetPrototypeDelete(httpConn.managedResources, streamRid)) {
-        core.close(streamRid);
-      }
-    }
-  };
-}
-
-const _ws = Symbol("[[associated_ws]]");
-const websocketCvf = buildCaseInsensitiveCommaValueFinder("websocket");
-const upgradeCvf = buildCaseInsensitiveCommaValueFinder("upgrade");
-
-function upgradeWebSocket(request, options = {}) {
-  const upgrade = request.headers.get("upgrade");
-  const upgradeHasWebSocketOption = upgrade !== null &&
-    websocketCvf(upgrade);
-  if (!upgradeHasWebSocketOption) {
-    throw new TypeError(
-      "Invalid Header: 'upgrade' header must contain 'websocket'",
-    );
-  }
-
-  const connection = request.headers.get("connection");
-  const connectionHasUpgradeOption = connection !== null &&
-    upgradeCvf(connection);
-  if (!connectionHasUpgradeOption) {
-    throw new TypeError(
-      "Invalid Header: 'connection' header must contain 'Upgrade'",
-    );
-  }
-
-  const websocketKey = request.headers.get("sec-websocket-key");
-  if (websocketKey === null) {
-    throw new TypeError(
-      "Invalid Header: 'sec-websocket-key' header must be set",
-    );
-  }
-
-  const accept = ops.op_http_websocket_accept_header(websocketKey);
-
-  const r = newInnerResponse(101);
-  r.headerList = [
-    ["upgrade", "websocket"],
-    ["connection", "Upgrade"],
-    ["sec-websocket-accept", accept],
-  ];
-
-  const protocolsStr = request.headers.get("sec-websocket-protocol") || "";
-  const protocols = StringPrototypeSplit(protocolsStr, ", ");
-  if (protocols && options.protocol) {
-    if (ArrayPrototypeIncludes(protocols, options.protocol)) {
-      ArrayPrototypePush(r.headerList, [
-        "sec-websocket-protocol",
-        options.protocol,
-      ]);
-    } else {
-      throw new TypeError(
-        `Protocol '${options.protocol}' not in the request's protocol list (non negotiable)`,
-      );
-    }
-  }
-
-  const response = fromInnerResponse(r, "immutable");
-
-  const socket = webidl.createBranded(WebSocket);
-  setEventTargetData(socket);
-  socket[_server] = true;
-  response[_ws] = socket;
-  socket[_idleTimeoutDuration] = options.idleTimeout ?? 120;
-  socket[_idleTimeoutTimeout] = null;
-
-  return { response, socket };
-}
-
-function upgradeHttp(req) {
-  req[_deferred] = new Deferred();
-  return req[_deferred].promise;
-}
-
-async function upgradeHttpRaw(req, tcpConn) {
-  const inner = toInnerRequest(req);
-  const res = await core.opAsync("op_http_upgrade_early", inner[streamRid]);
-  return new TcpConn(res, tcpConn.remoteAddr, tcpConn.localAddr);
-}
-
-const spaceCharCode = StringPrototypeCharCodeAt(" ", 0);
-const tabCharCode = StringPrototypeCharCodeAt("\t", 0);
-const commaCharCode = StringPrototypeCharCodeAt(",", 0);
-
-/** Builds a case function that can be used to find a case insensitive
- * value in some text that's separated by commas.
- *
- * This is done because it doesn't require any allocations.
- * @param checkText {string} - The text to find. (ex. "websocket")
+/** Upgrades a request immediately, returning a promise with a raw network stream
+ * connection that will resolve when the system has prepared the connection fully.
  */
-function buildCaseInsensitiveCommaValueFinder(checkText) {
-  const charCodes = ArrayPrototypeMap(
-    StringPrototypeSplit(
-      StringPrototypeToLowerCase(checkText),
-      "",
-    ),
-    (c) => [c.charCodeAt(0), c.toUpperCase().charCodeAt(0)],
-  );
-  /** @type {number} */
-  let i;
-  /** @type {number} */
-  let char;
+async function upgradeHttp(request, { headers }) {
+  const slab_id = request[slabId]();
+  const response_headers = [];
+  for (const [key, value] of ObjectEntries(headers ?? {})) {
+    response_headers.push([key, value]);
+  }
+  const rid = await core.opAsync("op_upgrade", slab_id, response_headers);
+  return new TcpConn(rid, null, null);
+}
 
-  /** @param value {string} */
-  return function (value) {
-    for (i = 0; i < value.length; i++) {
-      char = value.charCodeAt(i);
-      skipWhitespace(value);
+/** Upgrades a connection lazily, returning a raw network stream that initially emulates a
+ * raw HTTP/1.1 connection. Once a valid HTTP/1.1 response has been provided, becomes a
+ * true network stream. The underlying HTTP protocol may not be HTTP/1.1, but this API
+ * expects the caller to speak HTTP/1.1.
+*/
+async function upgradeHttpRaw(request) {
+  // const inner = toInnerRequest(req);
+  // const res = core.opAsync("op_http_upgrade_early", inner[streamRid]);
+  // return new TcpConn(res, tcpConn.remoteAddr, tcpConn.localAddr);
+}
 
-      if (hasWord(value)) {
-        skipWhitespace(value);
-        if (i === value.length || char === commaCharCode) {
-          return true;
-        }
-      } else {
-        skipUntilComma(value);
-      }
+const slabId = Symbol("slab_id");
+
+class RequestHeaders {
+  #slab_id;
+
+  get(header) {
+    const value = core.ops.op_get_request_header(this.#slab_id, header);
+    return value;
+  }
+}
+
+class InnerRequest {
+  #slab_id;
+  #headers;
+  #uri_prefix;
+  #method_and_uri;
+  #resource_set;
+  #stream_rid;
+  #body;
+
+  constructor(slab_id, uri_prefix, resource_set) {
+    this.#slab_id = slab_id;
+    this.#uri_prefix = uri_prefix;
+    this.#resource_set = resource_set;
+  }
+
+  close() {
+    if (this.#stream_rid !== undefined) {
+      core.close(this.#stream_rid);
+      this.#stream_rid = undefined;
     }
+    this.#slab_id = undefined;
+  }
 
-    return false;
-  };
-
-  /** @param value {string} */
-  function hasWord(value) {
-    for (let j = 0; j < charCodes.length; ++j) {
-      const { 0: cLower, 1: cUpper } = charCodes[j];
-      if (cLower === char || cUpper === char) {
-        char = StringPrototypeCharCodeAt(value, ++i);
-      } else {
-        return false;
+  url() {
+    if (this.#method_and_uri === undefined) {
+      if (this.#slab_id === undefined) {
+        throw new TypeError("request closed");
       }
+      this.#method_and_uri = core.ops.op_get_request_method_and_url(this.#slab_id);
     }
+    return this.#uri_prefix + this.#method_and_uri[2];
+  }
+
+  text() {
+    return "";
+  }
+
+  get method() {
+    if (this.#method_and_uri === undefined) {
+      if (this.#slab_id === undefined) {
+        throw new TypeError("request closed");
+      }
+      this.#method_and_uri = core.ops.op_get_request_method_and_url(this.#slab_id);
+    }
+    return this.#method_and_uri[0];
+  }
+
+  get body() {
+    if (this.#slab_id === undefined) {
+      throw new TypeError("request closed");
+    }
+    if (this.#body !== undefined) {
+      return this.#body;
+    }
+    // TODO(mmastrac): We should be checking this somewhere else, I think
+    if (this.method == "GET" || this.method == "HEAD") {
+      this.#body = null;
+      return null;
+    }
+    this.#stream_rid = core.ops.op_read_request_body(this.#slab_id);
+    this.#body = new InnerBody(readableStreamForRid(this.#stream_rid, false));
+    return this.#body;
+  }
+
+  get headerList() {
+    if (this.#slab_id === undefined) {
+      throw new TypeError("request closed");
+    }
+    return core.ops.op_get_request_headers(this.#slab_id);
+  }
+
+  get headers() {
+    if (!this.#headers) {
+      if (this.#slab_id === undefined) {
+        throw new TypeError("request closed");
+      }
+      this.#headers = new RequestHeaders(this.#slab_id);
+    }
+    return this.#headers;
+  }
+
+  get slabId() {
+    return this.#slab_id;
+  }
+}
+
+class CallbackContext {
+  fallback_base_url;
+  server_rid;
+
+  initialize(fallback_base_url) {
+    this.fallback_base_url = fallback_base_url;
+  }
+}
+
+// This function is only called if innerResp is something more complicated than a
+// string, buffer of bytes, or null.
+function return_response(req, innerResp) {
+  // If response body length is known, it will be sent synchronously in a
+  // single op, in other case a "response body" resource will be created and
+  // we'll be streaming it.
+  /** @type {ReadableStream<Uint8Array> | Uint8Array | null} */
+  // let respBody = null;
+  // if (innerResp.body !== null) {
+  //   if (innerResp.body.unusable()) {
+  //     throw new TypeError("Body is unusable.");
+  //   }
+  //   if (
+  //     ObjectPrototypeIsPrototypeOf(
+  //       ReadableStreamPrototype,
+  //       innerResp.body.streamOrStatic,
+  //     )
+  //   ) {
+  //     if (
+  //       innerResp.body.length === null ||
+  //       ObjectPrototypeIsPrototypeOf(
+  //         BlobPrototype,
+  //         innerResp.body.source,
+  //       )
+  //     ) {
+  //       respBody = innerResp.body.stream;
+  //     } else {
+  //       const reader = innerResp.body.stream.getReader();
+  //       const r1 = await reader.read();
+  //       if (r1.done) {
+  //         respBody = new Uint8Array(0);
+  //       } else {
+  //         respBody = r1.value;
+  //         const r2 = await reader.read();
+  //         if (!r2.done) throw new TypeError("Unreachable");
+  //       }
+  //     }
+  //   } else {
+  //     innerResp.body.streamOrStatic.consumed = true;
+  //     respBody = innerResp.body.streamOrStatic.body;
+  //   }
+  // } else {
+  //   respBody = new Uint8Array(0);
+  // }
+  // const isStreamingResponseBody = !(
+  //   typeof respBody === "string" ||
+  //   ObjectPrototypeIsPrototypeOf(Uint8ArrayPrototype, respBody)
+  // );
+  // try {
+  //   await core.opAsync(
+  //     "op_http_write_headers",
+  //     streamRid,
+  //     innerResp.status ?? 200,
+  //     innerResp.headerList,
+  //     isStreamingResponseBody ? null : respBody,
+  //   );
+  // } catch (error) {
+  //   const connError = httpConn[connErrorSymbol];
+  //   if (
+  //     ObjectPrototypeIsPrototypeOf(BadResourcePrototype, error) &&
+  //     connError != null
+  //   ) {
+  //     // deno-lint-ignore no-ex-assign
+  //     error = new connError.constructor(connError.message);
+  //   }
+  //   if (
+  //     respBody !== null &&
+  //     ObjectPrototypeIsPrototypeOf(ReadableStreamPrototype, respBody)
+  //   ) {
+  //     await respBody.cancel(error);
+  //   }
+  //   throw error;
+  // }
+
+  // if (isStreamingResponseBody) {
+  //   let success = false;
+  //   if (
+  //     respBody === null ||
+  //     !ObjectPrototypeIsPrototypeOf(ReadableStreamPrototype, respBody)
+  //   ) {
+  //     throw new TypeError("Unreachable");
+  //   }
+  //   const resourceBacking = getReadableStreamResourceBacking(respBody);
+  //   let reader;
+  //   if (resourceBacking) {
+  //     if (respBody.locked) {
+  //       throw new TypeError("ReadableStream is locked.");
+  //     }
+  //     reader = respBody.getReader(); // Aquire JS lock.
+  //     try {
+  //       await core.opAsync(
+  //         "op_http_write_resource",
+  //         streamRid,
+  //         resourceBacking.rid,
+  //       );
+  //       if (resourceBacking.autoClose) core.tryClose(resourceBacking.rid);
+  //       readableStreamClose(respBody); // Release JS lock.
+  //       success = true;
+  //     } catch (error) {
+  //       const connError = httpConn[connErrorSymbol];
+  //       if (
+  //         ObjectPrototypeIsPrototypeOf(BadResourcePrototype, error) &&
+  //         connError != null
+  //       ) {
+  //         // deno-lint-ignore no-ex-assign
+  //         error = new connError.constructor(connError.message);
+  //       }
+  //       await reader.cancel(error);
+  //       throw error;
+  //     }
+  //   } else {
+  //     reader = respBody.getReader();
+  //     while (true) {
+  //       const { value, done } = await reader.read();
+  //       if (done) break;
+  //       if (!ObjectPrototypeIsPrototypeOf(Uint8ArrayPrototype, value)) {
+  //         await reader.cancel(new TypeError("Value not a Uint8Array"));
+  //         break;
+  //       }
+  //       try {
+  //         await core.opAsync2("op_http_write", streamRid, value);
+  //       } catch (error) {
+  //         const connError = httpConn[connErrorSymbol];
+  //         if (
+  //           ObjectPrototypeIsPrototypeOf(BadResourcePrototype, error) &&
+  //           connError != null
+  //         ) {
+  //           // deno-lint-ignore no-ex-assign
+  //           error = new connError.constructor(connError.message);
+  //         }
+  //         await reader.cancel(error);
+  //         throw error;
+  //       }
+  //     }
+  //     success = true;
+  //   }
+
+  //   if (success) {
+  //     try {
+  //       await core.opAsync("op_http_shutdown", streamRid);
+  //     } catch (error) {
+  //       await reader.cancel(error);
+  //       throw error;
+  //     }
+  //   }
+  // }
+}
+
+
+function fastSyncResponse(req, respBody) {
+  if (respBody === null || respBody === undefined) {
+    core.ops.op_set_response_body_text(req, "");
     return true;
   }
 
-  /** @param value {string} */
-  function skipWhitespace(value) {
-    while (char === spaceCharCode || char === tabCharCode) {
-      char = StringPrototypeCharCodeAt(value, ++i);
-    }
+  const body = respBody.streamOrStatic.body;
+  if (ObjectPrototypeIsPrototypeOf(Uint8ArrayPrototype, body)) {
+    core.ops.op_set_response_body_bytes(req, body.buffer);
+    return true;
+  } else if (typeof body === "string") {
+    core.ops.op_set_response_body_text(req, body);
+    return true;
   }
-
-  /** @param value {string} */
-  function skipUntilComma(value) {
-    while (char !== commaCharCode && i < value.length) {
-      char = StringPrototypeCharCodeAt(value, ++i);
-    }
-  }
+  return false;
 }
 
-// Expose this function for unit tests
-internals.buildCaseInsensitiveCommaValueFinder =
-  buildCaseInsensitiveCommaValueFinder;
-
-function hostnameForDisplay(hostname) {
-  // If the hostname is "0.0.0.0", we display "localhost" in console
-  // because browsers in Windows don't resolve "0.0.0.0".
-  // See the discussion in https://github.com/denoland/deno_std/issues/1165
-  return hostname === "0.0.0.0" ? "localhost" : hostname;
-}
-
-async function respond(handler, requestEvent, connInfo, onError) {
-  let response;
-
-  try {
-    response = await handler(requestEvent.request, connInfo);
-
-    if (response.bodyUsed && response.body !== null) {
-      throw new TypeError("Response body already consumed.");
-    }
-  } catch (e) {
-    // Invoke `onError` handler if the request handler throws.
-    response = await onError(e);
+async function asyncResponse(req, respBody) {
+  const stream = respBody.streamOrStatic;
+  // At this point in the response it needs to be a stream
+  if (!ObjectPrototypeIsPrototypeOf(ReadableStreamPrototype, stream)) {
+    throw TypeError("invalid response");
   }
-
-  try {
-    // Send the response.
-    await requestEvent.respondWith(response);
-  } catch {
-    // `respondWith()` can throw for various reasons, including downstream and
-    // upstream connection errors, as well as errors thrown during streaming
-    // of the response content.  In order to avoid false negatives, we ignore
-    // the error here and let `serveHttp` close the connection on the
-    // following iteration if it is in fact a downstream connection error.
-  }
-}
-
-async function serveConnection(
-  server,
-  activeHttpConnections,
-  handler,
-  httpConn,
-  connInfo,
-  onError,
-) {
-  while (!server.closed) {
-    let requestEvent = null;
-
+  const resourceBacking = getReadableStreamResourceBacking(stream);
+  if (resourceBacking) {
+    core.ops.op_set_response_body_resource(req, resourceBacking.rid, resourceBacking.autoClose);
+  } else {
+    console.log("stm");
+    const responseRid = core.ops.op_set_response_body_stream(req);
+    console.log("stm", responseRid);
+    const reader = stream.getReader();
+    const responseStream = writableStreamForRid(responseRid, true);
+    const writer = responseStream.getWriter();
+    console.log("stm", 3);
     try {
-      // Yield the new HTTP request on the connection.
-      requestEvent = await httpConn.nextRequest();
-    } catch {
-      // Connection has been closed.
-      break;
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        await writer.write(value);
+      }
+    } catch (e) {
+      console.log(e);
+    } finally {
+      writer.releaseLock();
+      reader.releaseLock();
     }
+    responseStream.close();
+    console.log("stm");
+  }
+}
 
-    if (requestEvent === null) {
-      break;
+function map_to_userland(requests, context, callback, wantsPromise, onError) {
+  return function(req) {
+    const innerRequest = new InnerRequest(req, context.fallback_base_url);
+    requests.add(innerRequest);
+    const request = fromInnerRequest(innerRequest, "immutable");
+    const response = callback(request, wantsPromise ? (() => core.opAsync("op_http_track", req, context.server_rid)) : undefined);
+    // TODO: Detect promises better
+    // TODO: Some response types are faster when we send them to ops, some are faster when we return them
+    if (response.then) {
+      // If the callback is a promise, wrap it in another promise where we can do the response serving
+      // magic.
+      return (async () => {
+        try {
+          // TODO(mmastrac): Code is duplicated between async/sync paths for now -- check perf if we extract it to a function
+          const awaited_response = await response;
+          const inner = toInnerResponse(awaited_response);
+          if (headers && headers.length > 0) {
+            if (headers.length == 1) {
+              core.ops.op_set_response_header(req, headers[0][0], headers[0][1]);
+            } else {
+              core.ops.op_set_response_headers(req, headers);
+            }
+          }
+              if (!fastSyncResponse(req, inner.body)) {
+            await asyncResponse(req, inner.body);
+          }
+          core.ops.op_set_promise_complete(req, 200);
+          requests.delete(innerRequest);
+          innerRequest.close();
+        } catch (e) {
+          onError(e);
+        }
+      })();
+    } else {
+      const inner = toInnerResponse(response);
+      const headers = inner.headerList;
+      if (headers && headers.length > 0) {
+        if (headers.length == 1) {
+          core.ops.op_set_response_header(req, headers[0][0], headers[0][1]);
+        } else {
+          core.ops.op_set_response_headers(req, headers);
+        }
+      }
+      if (!fastSyncResponse(req, inner.body)) {
+        // The response is not synchronous, so we're going to have to return a promise
+        // TODO(mmastrac)
+      }
+
+      // Return undefined to use the body we're building
+      requests.delete(innerRequest);
+      innerRequest.close();
+      return;
     }
-
-    respond(handler, requestEvent, connInfo, onError);
   }
+}
 
-  SetPrototypeDelete(activeHttpConnections, httpConn);
-  try {
-    httpConn.close();
-  } catch {
-    // Connection has already been closed.
-  }
+function serveHttp(conn) {
+  return new HttpConn(conn.rid);
 }
 
 async function serve(arg1, arg2) {
@@ -651,17 +609,21 @@ async function serve(arg1, arg2) {
     console.error(error);
     return new Response("Internal Server Error", { status: 500 });
   };
-  const onListen = options.onListen ?? function ({ port }) {
-    console.log(
-      `Listening on http://${hostnameForDisplay(listenOpts.hostname)}:${port}/`,
-    );
-  };
+  const onListen = options.onListen ?? function ({ port }) {};
+
+  const serverDeferred = new Deferred();
+  const activeHttpConnections = new SafeSet();
+
   const listenOpts = {
     hostname: options.hostname ?? "127.0.0.1",
     port: options.port ?? 9000,
     reusePort: options.reusePort ?? false,
   };
-
+  
+  // TODO(mmastrac): clean these up on abort
+  const requests = new Set();
+  const context = new CallbackContext();
+  let rid;
   if (options.cert || options.key) {
     if (!options.cert || !options.key) {
       throw new TypeError(
@@ -670,115 +632,17 @@ async function serve(arg1, arg2) {
     }
     listenOpts.cert = options.cert;
     listenOpts.key = options.key;
-  }
-
-  let listener;
-  if (listenOpts.cert && listenOpts.key) {
-    listener = listenTls({
-      hostname: listenOpts.hostname,
-      port: listenOpts.port,
-      cert: listenOpts.cert,
-      key: listenOpts.key,
-      reusePort: listenOpts.reusePort,
-    });
+    const listener = Deno.listenTls(listenOpts);
+    rid = core.ops.op_serve_http(listener.rid, context.initialize.bind(context), map_to_userland(requests, context, handler, false, onError));
+    context.server_rid = rid;
   } else {
-    listener = listen({
-      hostname: listenOpts.hostname,
-      port: listenOpts.port,
-      reusePort: listenOpts.reusePort,
-    });
+    const listener = Deno.listen(listenOpts);
+    rid = core.ops.op_serve_http(listener.rid, context.initialize.bind(context), map_to_userland(requests, context, handler, false, onError));
+    context.server_rid = rid;
   }
 
-  const serverDeferred = new Deferred();
-  const activeHttpConnections = new SafeSet();
-
-  const server = {
-    transport: listenOpts.cert && listenOpts.key ? "https" : "http",
-    hostname: listenOpts.hostname,
-    port: listenOpts.port,
-    closed: false,
-
-    close() {
-      if (server.closed) {
-        return;
-      }
-      server.closed = true;
-      try {
-        listener.close();
-      } catch {
-        // Might have been already closed.
-      }
-
-      for (const httpConn of new SafeSetIterator(activeHttpConnections)) {
-        try {
-          httpConn.close();
-        } catch {
-          // Might have been already closed.
-        }
-      }
-
-      SetPrototypeClear(activeHttpConnections);
-      serverDeferred.resolve();
-    },
-
-    async serve() {
-      while (!server.closed) {
-        let conn;
-
-        try {
-          conn = await listener.accept();
-        } catch {
-          // Listener has been closed.
-          if (!server.closed) {
-            console.log("Listener has closed unexpectedly");
-          }
-          break;
-        }
-
-        let httpConn;
-        try {
-          const rid = ops.op_http_start(conn.rid);
-          httpConn = new HttpConn(rid, conn.remoteAddr, conn.localAddr);
-        } catch {
-          // Connection has been closed;
-          continue;
-        }
-
-        SetPrototypeAdd(activeHttpConnections, httpConn);
-
-        const connInfo = {
-          localAddr: conn.localAddr,
-          remoteAddr: conn.remoteAddr,
-        };
-        // Serve the HTTP connection
-        serveConnection(
-          server,
-          activeHttpConnections,
-          handler,
-          httpConn,
-          connInfo,
-          onError,
-        );
-      }
-      await serverDeferred.promise;
-    },
-  };
-
-  signal?.addEventListener(
-    "abort",
-    () => {
-      try {
-        server.close();
-      } catch {
-        // Pass
-      }
-    },
-    { once: true },
-  );
-
-  onListen(listener.addr);
-
-  await PromisePrototypeCatch(server.serve(), console.error);
+  // Await the underlying server
+  await core.opAsync("op_http_wait", rid);
 }
 
-export { _ws, HttpConn, serve, upgradeHttp, upgradeHttpRaw, upgradeWebSocket };
+export { HttpConn, serve, serveHttp, upgradeHttp, upgradeHttpRaw };

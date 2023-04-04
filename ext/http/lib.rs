@@ -34,7 +34,6 @@ use deno_core::ResourceId;
 use deno_core::StringOrBuffer;
 use deno_core::WriteOutcome;
 use deno_core::ZeroCopyBuf;
-use deno_websocket::ws_create_server_stream;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use fly_accept_encoding::Encoding;
@@ -76,6 +75,8 @@ use crate::reader_stream::ExternallyAbortableReaderStream;
 use crate::reader_stream::ShutdownHandle;
 
 pub mod compressible;
+mod http2;
+mod js_callback;
 mod reader_stream;
 mod websocket_upgrade;
 
@@ -88,10 +89,27 @@ deno_core::extension!(
     op_http_headers,
     op_http_write,
     op_http_write_resource,
+    op_http_write_complete,
     op_http_shutdown,
     op_http_websocket_accept_header,
     op_http_upgrade_early,
-    op_http_upgrade_websocket,
+    http2::op_serve_http,
+    http2::op_serve_http_on,
+    http2::op_http_wait,
+    http2::op_http_track,
+    http2::op_set_response_header,
+    http2::op_set_response_headers,
+    http2::op_set_response_body_text,
+    http2::op_set_promise_complete,
+    http2::op_set_response_body_bytes,
+    http2::op_set_response_body_resource,
+    http2::op_set_response_body_stream,
+    http2::op_get_request_header,
+    http2::op_get_request_headers,
+    http2::op_get_request_method_and_url,
+    http2::op_read_request_body,
+    http2::op_upgrade,
+    http2::op_upgrade_raw,
   ],
   esm = ["01_http.js"],
 );
@@ -575,6 +593,29 @@ fn req_headers(
   }
 
   headers
+}
+
+#[op]
+fn op_http_write_complete(
+  state: Rc<RefCell<OpState>>,
+  rid: u32,
+  content: ZeroCopyBuf,
+) -> Result<(), AnyError> {
+  let stream = state
+    .borrow_mut()
+    .resource_table
+    .get::<HttpStreamResource>(rid)?;
+  let new_wr = HttpResponseWriter::Closed;
+  let mut old_wr = RcRef::map(&stream, |r| &r.wr).try_borrow_mut().unwrap(); //.await;
+  let response_tx = match replace(&mut *old_wr, new_wr) {
+    HttpResponseWriter::Headers(response_tx) => response_tx,
+    _ => return Err(http_error("response headers already sent")),
+  };
+  response_tx
+    .send(Response::new(Body::from(Bytes::copy_from_slice(&content))))
+    .unwrap();
+  state.borrow_mut().resource_table.close(rid)?;
+  Ok(())
 }
 
 #[op]
@@ -1160,33 +1201,6 @@ impl tokio::io::AsyncWrite for UpgradedStream {
   ) -> std::task::Poll<Result<(), std::io::Error>> {
     Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
   }
-}
-
-impl deno_websocket::Upgraded for UpgradedStream {}
-
-#[op]
-async fn op_http_upgrade_websocket(
-  state: Rc<RefCell<OpState>>,
-  rid: ResourceId,
-) -> Result<ResourceId, AnyError> {
-  let stream = state
-    .borrow_mut()
-    .resource_table
-    .get::<HttpStreamResource>(rid)?;
-  let mut rd = RcRef::map(&stream, |r| &r.rd).borrow_mut().await;
-
-  let request = match &mut *rd {
-    HttpRequestReader::Headers(request) => request,
-    _ => {
-      return Err(http_error("cannot upgrade because request body was used"))
-    }
-  };
-
-  let transport = hyper::upgrade::on(request).await?;
-  let ws_rid =
-    ws_create_server_stream(&state, Box::pin(UpgradedStream(transport)))
-      .await?;
-  Ok(ws_rid)
 }
 
 // Needed so hyper can use non Send futures

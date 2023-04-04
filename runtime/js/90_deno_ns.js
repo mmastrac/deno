@@ -20,8 +20,6 @@ import * as fsEvents from "ext:runtime/40_fs_events.js";
 import * as process from "ext:runtime/40_process.js";
 import * as signals from "ext:runtime/40_signals.js";
 import * as tty from "ext:runtime/40_tty.js";
-// TODO(bartlomieju): this is funky we have two `http` imports
-import * as httpRuntime from "ext:runtime/40_http.js";
 import * as kv from "ext:deno_kv/01_db.ts";
 
 const denoNs = {
@@ -127,8 +125,7 @@ const denoNs = {
   permissions: permissions.permissions,
   Permissions: permissions.Permissions,
   PermissionStatus: permissions.PermissionStatus,
-  // TODO(bartlomieju): why is this not in one of extensions?
-  serveHttp: httpRuntime.serveHttp,
+  serveHttp: http.serveHttp,
   resolveDns: net.resolveDns,
   upgradeWebSocket: http.upgradeWebSocket,
   utime: fs.utime,

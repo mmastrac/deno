@@ -9,7 +9,7 @@ for await (const conn of listener) {
   (async () => {
     const requests = Deno.serveHttp(conn);
     for await (const { respondWith, request } of requests) {
-      const bar = request.headers.get("foo");
+      const bar = request.headers.get("foo") ?? "missing";
       respondWith(new Response(bar))
         .catch((e) => console.log(e));
     }

@@ -930,7 +930,7 @@ async function readableStreamCollectIntoUint8Array(stream) {
  *
  * @param {number} rid The resource ID to write to.
  * @param {boolean=} autoClose If the resource should be auto-closed when the stream closes. Defaults to true.
- * @returns {ReadableStream<Uint8Array>}
+ * @returns {WritableStream<Uint8Array>}
  */
 function writableStreamForRid(rid, autoClose = true) {
   const stream = webidl.createBranded(WritableStream);

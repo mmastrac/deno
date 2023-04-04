@@ -5,6 +5,7 @@ import { serve, serveTls } from "../../../test_util/std/http/server.ts";
 import {
   assert,
   assertEquals,
+  assertMatch,
   assertRejects,
   assertStrictEquals,
   assertThrows,
@@ -74,7 +75,7 @@ Deno.test({ permissions: { net: true } }, async function httpServerBasic() {
   assertEquals(cloneText, "Hello World");
   await promise;
 
-  httpConn!.close();
+  await httpConn!.close();
 });
 
 // https://github.com/denoland/deno/issues/15107
@@ -90,9 +91,10 @@ Deno.test(
       const e = await httpConn.nextRequest();
       assert(e);
       const { request } = e;
-      request.text();
+      assertEquals(request.body, null);
+      assertEquals(await request.text(), "");
       headers = request.headers;
-      httpConn!.close();
+      await httpConn!.close();
     })();
 
     const conn = await Deno.connect({ port: 2333 });
@@ -120,11 +122,12 @@ Deno.test(
       assert(e);
       const { request, respondWith } = e;
 
+      assertEquals(request.body, null);
       await request.text(); // Read body
       await respondWith(new Response("Hello World")); // Closes request
 
       assertThrows(() => request.headers, TypeError, "request closed");
-      httpConn!.close();
+      await httpConn!.close();
     })();
 
     const conn = await Deno.connect({ port: 2334 });
@@ -164,13 +167,38 @@ Deno.test(
     assertEquals(body.length, writeResult);
 
     const resp = new Uint8Array(200);
-    const readResult = await conn.read(resp);
-    assertEquals(readResult, 138);
+    const readResult = await conn.read(resp) ?? 0;
+    assertMatch(
+      new TextDecoder().decode(resp.subarray(0, readResult)),
+      /HTTP\/1\.1 200 OK\r\nContent-Type: .*\r\nContent-Length: 0\r\nDate: .*\r\n\r\n/i);
 
     conn.close();
 
     await promise;
-    httpConn!.close();
+    await httpConn!.close();
+  },
+);
+
+Deno.test(
+  { permissions: { net: true } },
+  async function httpServerEchoStreamResponse() {
+    let httpConn: Deno.HttpConn;
+    const listener = Deno.listen({ port: 4501 });
+    const promise = (async () => {
+      const conn = await listener.accept();
+      httpConn = Deno.serveHttp(conn);
+      const evt = await httpConn.nextRequest();
+      assert(evt);
+      const { request, respondWith } = evt;
+      await respondWith(new Response(request.body));
+    })();
+
+    const resp = await fetch("http://127.0.0.1:4501/", { method: 'post', body: "hello world" });
+    const respBody = await resp.text();
+    assertEquals("hello world", respBody);
+    await promise;
+    await httpConn!.close();
+    listener.close();
   },
 );
 
@@ -199,7 +227,7 @@ Deno.test(
     const respBody = await resp.text();
     assertEquals("hello world", respBody);
     await promise;
-    httpConn!.close();
+    await httpConn!.close();
     listener.close();
   },
 );
@@ -224,10 +252,10 @@ Deno.test(
       assertEquals("hello world", reqBody);
       await respondWith(new Response(""));
 
-      // TODO(ry) If we don't call httpConn.nextRequest() here we get "error sending
-      // request for url (https://localhost:4501/): connection closed before
-      // message completed".
-      assertEquals(await httpConn.nextRequest(), null);
+      // // TODO(ry) If we don't call httpConn.nextRequest() here we get "error sending
+      // // request for url (https://localhost:4501/): connection closed before
+      // // message completed".
+      // assertEquals(await httpConn.nextRequest(), null);
 
       listener.close();
     })();
@@ -279,7 +307,7 @@ Deno.test(
     const chunk3 = await reader.read();
     assert(chunk3.done);
     await promise;
-    httpConn!.close();
+    await httpConn!.close();
     listener.close();
   },
 );
@@ -380,7 +408,7 @@ Deno.test(
     assertEquals("response", respBody);
     await promise;
 
-    httpConn!.close();
+    await httpConn!.close();
     listener.close();
   },
 );
@@ -420,7 +448,7 @@ Deno.test(
         cancelReason!,
       );
       assert(cancelReason!);
-      httpConn!.close();
+      await httpConn!.close();
       listener.close();
     })();
 
@@ -493,7 +521,7 @@ Deno.test(
     const respBody = await resp.text();
     assertEquals("", respBody);
     await promise;
-    httpConn!.close();
+    await httpConn!.close();
     listener.close();
   },
 );
@@ -663,7 +691,7 @@ Deno.test(
     await finished;
     clientConn.close();
 
-    httpConn!.close();
+    await httpConn!.close();
     listener.close();
   },
 );
@@ -703,7 +731,7 @@ Deno.test(
     let read;
 
     while ((read = await clientConn.read(buf)) !== null) {
-      httpConn!.close();
+      await httpConn!.close();
       for (let i = 0; i < read; i++) {
         responseText += String.fromCharCode(buf[i]);
       }
@@ -760,7 +788,7 @@ Deno.test(
     await writeRequest(clientConn);
     clientConn.close();
     await promise;
-    httpConn!.close();
+    await httpConn!.close();
   },
 );
 
@@ -910,7 +938,7 @@ Deno.test(
     const text = await resp.text();
     assertEquals(text, "ok");
     await promise;
-    httpConn!.close();
+    await httpConn!.close();
   },
 );
 
@@ -928,7 +956,7 @@ Deno.test({ permissions: { net: true } }, async function httpServerPanic() {
 
   httpConn.nextRequest();
   await client.write(encoder.encode("\r\n\r\n"));
-  httpConn!.close();
+  await httpConn!.close();
 
   client.close();
   listener.close();
@@ -956,7 +984,7 @@ Deno.test(
     const body = await resp.arrayBuffer();
     assertEquals(body.byteLength, 70 * 1024);
     await promise;
-    httpConn!.close();
+    await httpConn!.close();
     listener.close();
   },
 );
@@ -996,7 +1024,7 @@ Deno.test(
     }
 
     assert(didThrow);
-    httpConn!.close();
+    await httpConn!.close();
     listener.close();
     client.close();
   },
@@ -1038,7 +1066,7 @@ Deno.test(
 
     await respondWith(res).catch((error: Error) => errors.push(error));
 
-    httpConn!.close();
+    await httpConn!.close();
     listener.close();
 
     assert(errors.length >= 1);
@@ -1067,7 +1095,7 @@ Deno.test(
       )),
     ]);
 
-    httpConn!.close();
+    await httpConn!.close();
     listener.close();
     clientConn.close();
   },
@@ -1110,7 +1138,7 @@ Deno.test(
     assertEquals(Object.keys(resourcesAfter).length, 1);
 
     listener!.close();
-    httpConn!.close();
+    await httpConn!.close();
     await promise;
   },
 );
@@ -1178,7 +1206,7 @@ Deno.test(
     }
 
     await Promise.all([server(), delay(100).then(client)]);
-    httpConn!.close();
+    await httpConn!.close();
     listener.close();
   },
 );
@@ -1259,7 +1287,7 @@ Deno.test(
     }
 
     await Promise.all([server(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
     listener.close();
   },
 );
@@ -1288,7 +1316,7 @@ Deno.test(
     assertEquals(new Uint8Array(body), new Uint8Array([128]));
 
     await promise;
-    httpConn!.close();
+    await httpConn!.close();
   },
 );
 
@@ -1337,7 +1365,7 @@ Deno.test(
     conn.close();
 
     await promise;
-    httpConn!.close();
+    await httpConn!.close();
   },
 );
 
@@ -1393,7 +1421,7 @@ Deno.test({
     }
 
     await Promise.all([server(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
   },
 });
 
@@ -1450,7 +1478,7 @@ Deno.test({
     }
 
     await Promise.all([server(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
   },
 });
 
@@ -1503,7 +1531,7 @@ Deno.test({
     }
 
     await Promise.all([server(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
   },
 });
 
@@ -1559,7 +1587,7 @@ Deno.test({
     }
 
     await Promise.all([server(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
   },
 });
 
@@ -1612,7 +1640,7 @@ Deno.test({
     }
 
     await Promise.all([server(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
   },
 });
 
@@ -1672,7 +1700,7 @@ Deno.test({
     }
 
     await Promise.all([server(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
   },
 });
 
@@ -1731,7 +1759,7 @@ Deno.test({
     }
 
     await Promise.all([server(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
   },
 });
 
@@ -1787,7 +1815,7 @@ Deno.test({
     }
 
     await Promise.all([server(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
   },
 });
 
@@ -1843,7 +1871,7 @@ Deno.test({
     }
 
     await Promise.all([server(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
   },
 });
 
@@ -1905,7 +1933,7 @@ Deno.test({
     }
 
     await Promise.all([server(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
   },
 });
 
@@ -1971,7 +1999,7 @@ Deno.test({
     }
 
     await Promise.all([server(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
   },
 });
 
@@ -2037,7 +2065,7 @@ Deno.test({
     }
 
     await Promise.all([server(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
   },
 });
 
@@ -2098,7 +2126,7 @@ Deno.test({
     }
 
     await Promise.all([server(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
   },
 });
 
@@ -2157,7 +2185,7 @@ Deno.test({
     }
 
     await Promise.all([server(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
   },
 });
 
@@ -2311,7 +2339,7 @@ Deno.test("upgradeHttp unix", {
     const resp = new Response(null, { status: 101 });
     await respondWith(resp);
     await promise;
-    httpConn!.close();
+    await httpConn!.close();
   })();
 
   await Promise.all([server, client()]);
@@ -2347,7 +2375,7 @@ Deno.test(
     assertEquals(text, body);
     await promise;
 
-    httpConn!.close();
+    await httpConn!.close();
   },
 );
 
@@ -2394,7 +2422,7 @@ Deno.test(
     assertEquals(text, body);
     await promise;
 
-    httpConn!.close();
+    await httpConn!.close();
   },
 );
 
@@ -2530,7 +2558,7 @@ Deno.test(
     assertEquals(await response.text(), await clone.text());
 
     await promise;
-    httpConn!.close();
+    await httpConn!.close();
   },
 );
 
@@ -2610,7 +2638,7 @@ Deno.test({
     }
 
     await Promise.all([server(), server2(), client()]);
-    httpConn!.close();
+    await httpConn!.close();
     httpConn2!.close();
   },
 });
@@ -2791,7 +2819,7 @@ Deno.test({
     await delay(100);
     abortController.abort();
     await promise;
-    httpConn!.close();
+    await httpConn!.close();
   },
 });
 

@@ -529,7 +529,7 @@ deno_core::extension!(deno_websocket,
     server::op_server_ws_send_binary,
     server::op_server_ws_send_text,
   ],
-  esm = [ "01_websocket.js", "02_websocketstream.js" ],
+  esm = [ "01_websocket.js", "02_websocketstream.js", "03_websockethttp.js" ],
   options = {
     user_agent: String,
     root_cert_store: Option<RootCertStore>,

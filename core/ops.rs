@@ -13,6 +13,7 @@ use futures::future::FusedFuture;
 use futures::future::MaybeDone;
 use futures::ready;
 use futures::task::noop_waker;
+use futures::task::AtomicWaker;
 use futures::Future;
 use serde::Serialize;
 use std::cell::RefCell;
@@ -202,6 +203,7 @@ pub struct OpState {
   pub resource_table: ResourceTable,
   pub get_error_class_fn: GetErrorClassFn,
   pub tracker: OpsTracker,
+  pub waker: AtomicWaker,
   pub last_fast_op_error: Option<AnyError>,
   gotham_state: GothamState,
 }
@@ -212,6 +214,7 @@ impl OpState {
       resource_table: Default::default(),
       get_error_class_fn: &|_| "Error",
       gotham_state: Default::default(),
+      waker: AtomicWaker::new(),
       last_fast_op_error: None,
       tracker: OpsTracker::new(ops_count),
     }

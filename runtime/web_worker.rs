@@ -460,7 +460,6 @@ impl WebWorker {
       ops::process::deno_process::init_ops(),
       ops::signal::deno_signal::init_ops(),
       ops::tty::deno_tty::init_ops(),
-      ops::http::deno_http_runtime::init_ops(),
       deno_permissions_web_worker::init_ops(
         permissions,
         unstable,

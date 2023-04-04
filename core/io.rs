@@ -3,6 +3,8 @@
 use std::ops::Deref;
 use std::ops::DerefMut;
 
+use bytes::Buf;
+use bytes::BufMut;
 use serde_v8::ZeroCopyBuf;
 
 /// BufView is a wrapper around an underlying contiguous chunk  of bytes. It can
@@ -62,6 +64,20 @@ impl BufView {
     let old = self.cursor;
     self.cursor = 0;
     old
+  }
+}
+
+impl Buf for BufView {
+  fn remaining(&self) -> usize {
+    self.len()
+  }
+
+  fn chunk(&self) -> &[u8] {
+    self.deref()
+  }
+
+  fn advance(&mut self, cnt: usize) {
+    self.advance_cursor(cnt)
   }
 }
 
@@ -207,6 +223,21 @@ impl BufMutView {
       }
       BufMutViewInner::Vec(vec) => vec,
     }
+  }
+}
+
+// Can we implement BufMut safely?
+impl Buf for BufMutView {
+  fn remaining(&self) -> usize {
+    self.len()
+  }
+
+  fn chunk(&self) -> &[u8] {
+    self.deref()
+  }
+
+  fn advance(&mut self, cnt: usize) {
+    self.advance_cursor(cnt)
   }
 }
 

@@ -24,11 +24,13 @@ brotli = "3.3.4"
 bytes.workspace = true
 cache_control.workspace = true
 deno_core.workspace = true
-deno_websocket.workspace = true
+deno_net.workspace = true
 flate2.workspace = true
 fly-accept-encoding = "0.2.0"
 httparse.workspace = true
 hyper = { workspace = true, features = ["server", "stream", "http1", "http2", "runtime"] }
+hyper1 = { package = "hyper", features = ["full"], git = "https://github.com/hyperium/hyper.git", tag = "v1.0.0-rc.3" }
+http-body-util = { git = "https://github.com/hyperium/http-body", tag = "v1.0.0-rc.2" }
 memmem.workspace = true
 mime = "0.3.16"
 once_cell.workspace = true
@@ -36,6 +38,7 @@ percent-encoding.workspace = true
 phf = { version = "0.10", features = ["macros"] }
 pin-project.workspace = true
 ring.workspace = true
+slab.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
