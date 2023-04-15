@@ -145,7 +145,9 @@ class HttpConn {
       const conn = this.#connections.pop();
       if (conn) {
         return { request: conn[1], respondWith: (resp) => { 
+          console.log("respond");
           conn[0](resp);
+          console.log("responded");
           // Return a promise tracking the state of the response
           return conn[2]();
         } };
@@ -541,12 +543,19 @@ function map_to_userland(requests, context, callback, wantsPromise, onError) {
               core.ops.op_set_response_headers(req, headers);
             }
           }
+          console.log(1);
+          console.log(inner.body);
           if (!fastSyncResponse(req, inner.body)) {
+            console.log(2);
             await asyncResponse(req, inner.body);
           }
+          console.log(3);
           core.ops.op_set_promise_complete(req, 200);
+          console.log(4);
           requests.delete(innerRequest);
+          console.log(5);
           innerRequest.close();
+          console.log(6);
         } catch (e) {
           onError(e);
         }
@@ -622,7 +631,7 @@ async function serve(arg1, arg2) {
   };
   
   // TODO(mmastrac): clean these up on abort
-  const requests = new Set();
+  const requests = new SafeSet();
   const context = new CallbackContext();
   let rid;
   if (options.cert || options.key) {

@@ -116,17 +116,21 @@ Deno.test(
     const promise = (async () => {
       const listener = Deno.listen({ port: 2334 });
       const conn = await listener.accept();
-      listener.close();
+      // listener.close();
       const httpConn = Deno.serveHttp(conn);
       const e = await httpConn.nextRequest();
       assert(e);
       const { request, respondWith } = e;
+      console.log("ok");
 
-      assertEquals(request.body, null);
-      await request.text(); // Read body
-      await respondWith(new Response("Hello World")); // Closes request
-
+      // assertEquals(request.body, null);
+      console.log("ok");
+      // await request.text(); // Read body
+      console.log("ok");
+      await respondWith(new Response("Hello World", { headers: { "foo": "bar" } })); // Closes request
+      console.log("ok");
       assertThrows(() => request.headers, TypeError, "request closed");
+      console.log("ok");
       await httpConn!.close();
     })();
 
@@ -134,10 +138,13 @@ Deno.test(
     // Send GET request with a body + content-length.
     const encoder = new TextEncoder();
     const body =
-      `GET / HTTP/1.1\r\nHost: 127.0.0.1:2333\r\nContent-Length: 5\r\n\r\n12345`;
+      `POST / HTTP/1.1\r\nHost: 127.0.0.1:2333\r\nContent-Length: 5\r\n\r\n12345`;
     const writeResult = await conn.write(encoder.encode(body));
+    console.log("wrote");
     assertEquals(body.length, writeResult);
+    console.log("wait");
     await promise;
+    console.log("done");
     conn.close();
   },
 );

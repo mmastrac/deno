@@ -169,7 +169,9 @@ impl ResponseBytesInner {
       }
     };
     if let Some(index) = index {
-      with_tracker_mut(index, |tracker| tracker.take().map(|t| t.send(Ok(()))));
+      println!("wakeup");
+      with_tracker_mut(index, |tracker| tracker.take().map(|t| t.send(Ok(())).unwrap()));
+      println!("wokeup");
     }
     current
   }
@@ -434,16 +436,20 @@ pub async fn op_upgrade(
 
 #[op]
 pub fn op_set_promise_complete(index: usize) {
+  println!("promise...");
   with_promise_mut(index, |promise| {
     let promise_state = std::mem::replace(promise, PromiseState::Resolved);
     match promise_state {
       PromiseState::None => {}
       PromiseState::Waiting(tx) => {
-        tx.send(());
+        println!("promise send!");
+        // TODO(mmastrac): Don't unwrap
+        tx.send(()).unwrap();
       }
       PromiseState::Resolved => {}
     }
   });
+  println!("promise!");
 }
 
 /// Compute the fallback address from the [`NetworkStreamListenAddress`]. If the request has no authority/host in
@@ -745,10 +751,12 @@ pub fn op_set_response_body_stream(
 
 #[op]
 pub fn op_set_response_body_text(index: usize, text: String) {
+  println!("body text");
   with_resp_mut(index, move |response| {
     *response.as_mut().unwrap().body_mut() =
       ResponseBytes(ResponseBytesInner::Bytes(index, BufView::from(text.into_bytes())))
   });
+  println!("body text done");
 }
 
 #[op]
@@ -762,6 +770,8 @@ pub fn op_set_response_body_bytes(index: usize, buffer: ZeroCopyBuf) {
 pub async fn op_http_track(state: Rc<RefCell<OpState>>, index: usize, server_rid: ResourceId) -> Result<(), AnyError> {
   let (tx, rx) = tokio::sync::oneshot::channel();
 
+  println!("track write");
+
   with_tracker_mut(index, |tracker| {
     *tracker = Some(tx);
   });
@@ -771,11 +781,17 @@ pub async fn op_http_track(state: Rc<RefCell<OpState>>, index: usize, server_rid
     .resource_table
     .get::<HttpJoinHandle>(server_rid)?.1.clone();
 
-  rx.map(|e| match e {
+    println!("track");
+
+  let res = rx.map(|e| match e {
     Err(e) => Err(AnyError::from(e)),
     Ok(Err(e)) => Err(AnyError::from(e)),
     Ok(Ok(x)) => Ok(x)
-  }).try_or_cancel(cancel_handle).await
+  }).try_or_cancel(cancel_handle).await;
+
+  println!("tracked");
+
+  res
 }
 
 fn serve_http<HC: HttpCallbackTrait>(
@@ -823,6 +839,7 @@ impl Resource for HttpJoinHandle {
   }
 
   fn close(self: Rc<Self>) {
+    println!("close");
     self.1.cancel()
   }
 }
