@@ -683,14 +683,14 @@ pub fn op_read_request_body(state: &mut OpState, index: usize) -> ResourceId {
 #[op]
 pub fn op_set_response_header(
   index: usize,
-  name: ByteString,
-  value: ByteString,
+  name: String,
+  value: String,
 ) {
   with_resp_mut(index, |resp| {
     let resp_headers = resp.as_mut().unwrap().headers_mut();
     resp_headers.append(
-      HeaderName::from_bytes(&name).unwrap(),
-      HeaderValue::from_bytes(&value).unwrap(),
+      HeaderName::from_bytes(&name.as_bytes()).unwrap(),
+      HeaderValue::from_bytes(&value.as_bytes()).unwrap(),
     );
   })
 }
@@ -698,15 +698,15 @@ pub fn op_set_response_header(
 #[op]
 pub fn op_set_response_headers(
   index: usize,
-  headers: Vec<(ByteString, ByteString)>,
+  headers: Vec<(String, String)>,
 ) {
   with_resp_mut(index, |resp| {
     let resp_headers = resp.as_mut().unwrap().headers_mut();
     resp_headers.reserve(headers.len());
     for (name, value) in headers {
       resp_headers.append(
-        HeaderName::from_bytes(&name).unwrap(),
-        HeaderValue::from_bytes(&value).unwrap(),
+        HeaderName::from_bytes(&name.as_bytes()).unwrap(),
+        HeaderValue::from_bytes(&value.as_bytes()).unwrap(),
       );
     }
   })

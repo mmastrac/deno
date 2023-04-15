@@ -533,6 +533,7 @@ function map_to_userland(requests, context, callback, wantsPromise, onError) {
           // TODO(mmastrac): Code is duplicated between async/sync paths for now -- check perf if we extract it to a function
           const awaited_response = await response;
           const inner = toInnerResponse(awaited_response);
+          const headers = inner.headerList;
           if (headers && headers.length > 0) {
             if (headers.length == 1) {
               core.ops.op_set_response_header(req, headers[0][0], headers[0][1]);
@@ -540,7 +541,7 @@ function map_to_userland(requests, context, callback, wantsPromise, onError) {
               core.ops.op_set_response_headers(req, headers);
             }
           }
-              if (!fastSyncResponse(req, inner.body)) {
+          if (!fastSyncResponse(req, inner.body)) {
             await asyncResponse(req, inner.body);
           }
           core.ops.op_set_promise_complete(req, 200);
