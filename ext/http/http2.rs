@@ -408,7 +408,7 @@ pub async fn op_upgrade(
     match promise {
       PromiseState::None => {}
       PromiseState::Waiting(tx) => {
-        tx.send(());
+        tx.send(()).unwrap();
       }
       PromiseState::Resolved => {
         return Err(bad_resource("connection already completed"));
@@ -615,7 +615,10 @@ impl Stream for ReadFuture {
     cx: &mut std::task::Context<'_>,
   ) -> std::task::Poll<Option<Self::Item>> {
     with_req_mut(self.0, |req| {
-      match Pin::new(req).poll_frame(cx) {
+      println!("frame?");
+      let res = Pin::new(req).poll_frame(cx);
+      println!("frame {:?}", res);
+      match res {
         std::task::Poll::Ready(Some(Ok(frame))) => {
           println!("frame");
           if let Ok(data) = frame.into_data() {
