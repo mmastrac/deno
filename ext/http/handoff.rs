@@ -19,7 +19,7 @@ struct AsyncHandoff<T: Unpin> {
   send_waker: Option<Waker>,
 }
 
-pub fn new<T: Unpin>() -> (AsyncHandoffSender<T>, AsyncHandoffReceiver<T>) {
+pub fn new_handoff<T: Unpin>() -> (AsyncHandoffSender<T>, AsyncHandoffReceiver<T>) {
   let handoff = Rc::new(RefCell::new(AsyncHandoff {
     value: None,
     recv_alive: true,
@@ -131,7 +131,7 @@ mod tests {
   async fn test_send() {
     let local = LocalSet::new();
     local.run_until(async {
-      let (tx, rx) = new::<u32>();
+      let (tx, rx) = new_handoff::<u32>();
       let handle = spawn_local(async move {
         rx.recv().await
       });
@@ -145,7 +145,7 @@ mod tests {
   async fn test_drop() {
     let local = LocalSet::new();
     local.run_until(async {
-      let (tx, rx) = new::<u32>();
+      let (tx, rx) = new_handoff::<u32>();
       drop(tx);
       let handle = spawn_local(async move {
         rx.recv().await
@@ -159,7 +159,7 @@ mod tests {
   async fn test_send_twice() {
     let local = LocalSet::new();
     local.run_until(async {
-      let (tx, rx) = new::<u32>();
+      let (tx, rx) = new_handoff::<u32>();
       let handle = spawn_local(async move {
         rx.recv().await.unwrap() + rx.recv().await.unwrap()
       });
@@ -174,7 +174,7 @@ mod tests {
   async fn test_send_then_drop() {
     let local = LocalSet::new();
     local.run_until(async {
-      let (tx, rx) = new::<u32>();
+      let (tx, rx) = new_handoff::<u32>();
       let handle = spawn_local(async move {
         assert_eq!(rx.recv().await.unwrap(), 1);
         assert_eq!(rx.recv().await, Err(HandoffError::Closed));

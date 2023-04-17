@@ -4,7 +4,6 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 
 use bytes::Buf;
-use bytes::BufMut;
 use serde_v8::ZeroCopyBuf;
 
 /// BufView is a wrapper around an underlying contiguous chunk  of bytes. It can

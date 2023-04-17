@@ -96,13 +96,15 @@ class HttpConn {
     const context = new CallbackContext();
     const onError = this.#onError.bind(this);
 
-    this.#httpRid = core.ops.op_serve_http_on(rid, context.initialize.bind(context), map_to_userland(this.#requests, context, (req, responsePromise) => {
+    const callback = map_to_userland(this.#requests, context, (req, responsePromise) => {
       const promise = new Promise(r => {
         connections.push([r, req, responsePromise]);
         waiters.pop()?.(true);
       });
       return promise;
-    }, true, onError));
+    }, true, onError);
+
+    this.#httpRid = core.ops.op_serve_http_on(rid, context.initialize.bind(context));
     context.server_rid = this.#httpRid;
 
     // Start the async IIFE to avoid looking like the event loop stalled
@@ -110,7 +112,13 @@ class HttpConn {
     // TODO(mmastrac): This IIFE should be the close promise
     (async () => {
       try {
-        await core.opAsync("op_http_wait", httpRid);
+        while (true) {
+          const req = await core.opAsync("op_http_wait", httpRid);
+          if (req == 0xffffffff) {
+            break;
+          }
+          callback(req);
+        }
       } catch (e) {
         // TODO(mmastrac): Is this the right way to get the exception?
         onError(new Deno.errors.Http(e.message));
@@ -119,7 +127,7 @@ class HttpConn {
         for (const waiter of this.#waiters) {
           waiter(false);
         }
-        this.#onError(new TypeError("closed"));
+        this.#closed = true;
         this.#closeResolve()
       }
     })()
@@ -141,6 +149,9 @@ class HttpConn {
     while (true) {
       if (this.#error) {
         throw this.#error;
+      }
+      if (this.#closed) {
+        return null;
       }
       const conn = this.#connections.pop();
       if (conn) {
@@ -169,7 +180,7 @@ class HttpConn {
     }
     this.#requests = new Set();
     // Don't allow further listening
-    this.#onError(new TypeError("closed"));
+    this.#closed = true;
     core.tryClose(this.#httpRid);
     await this.#closePromise;
   }
@@ -499,16 +510,19 @@ async function asyncResponse(req, respBody) {
     const reader = stream.getReader();
     const responseStream = writableStreamForRid(responseRid, true);
     const writer = responseStream.getWriter();
-    console.log("stm", 3);
+    core.ops.op_set_promise_complete(req, 200);
     try {
       while (true) {
+        console.log("reading");
         const { value, done } = await reader.read();
+        console.log("read", value, done);
         if (done) {
           break;
         }
         await writer.write(value);
       }
-    } catch (e) {
+    } catch (error) {
+      await reader.cancel(error);
       console.log(e);
     } finally {
       writer.releaseLock();
@@ -524,7 +538,13 @@ function map_to_userland(requests, context, callback, wantsPromise, onError) {
     const innerRequest = new InnerRequest(req, context.fallback_base_url);
     requests.add(innerRequest);
     const request = fromInnerRequest(innerRequest, "immutable");
-    const response = callback(request, wantsPromise ? (() => core.opAsync("op_http_track", req, context.server_rid)) : undefined);
+    const response = callback(request, wantsPromise ? (async () => { 
+      try { 
+        await core.opAsync("op_http_track", req, context.server_rid) 
+      } catch (e) { 
+        throw new Deno.errors.Http(e) 
+      } 
+    }) : undefined);
     // TODO: Detect promises better
     // TODO: Some response types are faster when we send them to ops, some are faster when we return them
     if (response.then) {
@@ -633,6 +653,8 @@ async function serve(arg1, arg2) {
   // TODO(mmastrac): clean these up on abort
   const requests = new SafeSet();
   const context = new CallbackContext();
+  const callback = map_to_userland(requests, context, handler, false, onError);
+
   let rid;
   if (options.cert || options.key) {
     if (!options.cert || !options.key) {
@@ -643,17 +665,23 @@ async function serve(arg1, arg2) {
     listenOpts.cert = options.cert;
     listenOpts.key = options.key;
     const listener = Deno.listenTls(listenOpts);
-    rid = core.ops.op_serve_http(listener.rid, context.initialize.bind(context), map_to_userland(requests, context, handler, false, onError));
+    rid = core.ops.op_serve_http(listener.rid, context.initialize.bind(context));
     context.server_rid = rid;
   } else {
     const listener = Deno.listen(listenOpts);
-    rid = core.ops.op_serve_http(listener.rid, context.initialize.bind(context), map_to_userland(requests, context, handler, false, onError));
+    rid = core.ops.op_serve_http(listener.rid, context.initialize.bind(context));
     context.server_rid = rid;
   }
 
   // Await the underlying server
-  await core.opAsync("op_http_wait", rid);
+  while (true) {
+    const req = await core.opAsync("op_http_wait", rid);
+    console.log(req);
+    if (req === 0xffffffff) {
+      break;
+    }
+    callback(req);
+  }
 }
 
 export { HttpConn, serve, serveHttp, upgradeHttp, upgradeHttpRaw };
- 

@@ -9,7 +9,6 @@ use std::io;
 use std::ops::DerefMut;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use bytes::Bytes;
 use deno_core::CancelHandle;
@@ -17,7 +16,6 @@ use deno_core::WriteOutcome;
 use deno_core::error::bad_resource;
 use deno_core::error::AnyError;
 use deno_core::futures::TryFutureExt;
-use deno_core::futures::future::ready;
 use deno_core::futures::stream::Peekable;
 use deno_core::futures::FutureExt;
 use deno_core::futures::Stream;
@@ -50,14 +48,11 @@ use hyper1::server::conn::http1;
 use hyper1::service::service_fn;
 use hyper1::StatusCode;
 use slab::Slab;
-use tokio::task::LocalSet;
 use tokio::task::spawn_local;
 use tokio::task::JoinHandle;
 
 type Request = hyper1::Request<Incoming>;
 type Response = hyper1::Response<ResponseBytes>;
-
-use crate::js_callback::JsCallback;
 
 #[derive(Default)]
 enum PromiseState {
@@ -73,7 +68,7 @@ pub struct HttpPair {
   response: Option<Response>,
   body: Option<Rc<HttpRequestBody>>,
   promise: PromiseState,
-  tracker: Option<tokio::sync::oneshot::Sender<Result<(), AnyError>>>,
+  tracker: Option<tokio::sync::oneshot::Sender<Result<bool, AnyError>>>,
 }
 
 thread_local! {
@@ -116,7 +111,7 @@ with!(
   http.promise
 );
 with!(with_http, with_http_mut, HttpPair, http, http);
-with!(with_tracker, with_tracker_mut, Option<tokio::sync::oneshot::Sender<Result<(), AnyError>>>, http, http.tracker);
+with!(with_tracker, with_tracker_mut, Option<tokio::sync::oneshot::Sender<Result<bool, AnyError>>>, http, http.tracker);
 
 fn slab_insert(request: Request) -> usize {
   SLAB.with(|slab| {
@@ -156,7 +151,8 @@ impl ResponseBytesInner {
     }
   }
 
-  pub fn finalize(&mut self) -> ResponseBytesInner {
+  pub fn finalize(&mut self, success: bool) -> ResponseBytesInner {
+    println!("finalize");
     let current = std::mem::take(self);
     let index = match current {
       Self::Done => None,
@@ -172,7 +168,8 @@ impl ResponseBytesInner {
     };
     if let Some(index) = index {
       println!("wakeup");
-      with_tracker_mut(index, |tracker| tracker.take().map(|t| t.send(Ok(())).unwrap()));
+      with_tracker_mut(index, |tracker| tracker.take().map(|t| t.send(Ok(success)).unwrap()));
+      SLAB.with(|slab| slab.borrow_mut().remove(index));
       println!("wokeup");
     }
     current
@@ -190,7 +187,7 @@ impl Body for ResponseBytes {
     match &mut self.0 {
       ResponseBytesInner::Done => std::task::Poll::Ready(None),
       ResponseBytesInner::Bytes(..) => {
-        if let ResponseBytesInner::Bytes(_, data) = self.0.finalize() {
+        if let ResponseBytesInner::Bytes(_, data) = self.0.finalize(true) {
           std::task::Poll::Ready(Some(Ok(Frame::data(data))))
         } else {
           unreachable!()
@@ -216,6 +213,7 @@ impl Body for ResponseBytes {
         }
       }
       ResponseBytesInner::V8Stream(index, stm) => {
+        println!("stream");
         match stm.poll_recv(cx) {
           std::task::Poll::Pending => std::task::Poll::Pending,
           std::task::Poll::Ready(Some(buf)) => {
@@ -223,6 +221,7 @@ impl Body for ResponseBytes {
             std::task::Poll::Ready(Some(Ok(Frame::data(BufView::from(buf)))))
           },
           std::task::Poll::Ready(None) => {
+            self.0.finalize(true);
             return std::task::Poll::Ready(None);
           }
         }
@@ -245,19 +244,13 @@ impl Body for ResponseBytes {
 
 impl Drop for ResponseBytes {
   fn drop(&mut self) {
-    self.0.finalize();
+    self.0.finalize(false);
   }
 }
 
 #[derive(Clone)]
 struct HttpCallback {
   pub op_state: Rc<RefCell<OpState>>,
-  pub callback: Rc<JsCallback>,
-}
-
-/// Trait for easier testing.
-trait HttpCallbackTrait: Clone + Send + 'static {
-  fn process_request(&self, index: usize) -> HttpCallbackFuture;
 }
 
 unsafe impl Send for HttpCallback {}
@@ -320,68 +313,14 @@ impl Future for HttpCallbackFuture {
 }
 
 impl HttpCallback {
-  /// Perform the synchronous v8 call.
-  #[inline(always)]
-  fn v8_sync_call(&self, index: usize) -> CallbackResult {
-    self.callback.call(|scope, func| {
-      let recv = v8::undefined(scope);
-      let key = v8::Integer::new_from_unsigned(scope, index as u32);
-      let res = func.call(scope, recv.into(), &[key.into()]);
-      if let Some(res) = res {
-        if res.is_promise() {
-          let promise: v8::Local<v8::Promise> = res.try_into().unwrap();
-          match promise.state() {
-            v8::PromiseState::Fulfilled => {
-              // A fulfilled promise is the same as just returning: we can treat it as if it were synchronous.
-            }
-            v8::PromiseState::Rejected => {
-              // TODO: If the promise is rejected, we should return an error
-            }
-            v8::PromiseState::Pending => {
-              // The callback returned a promise, so either the user parked the async function by awaiting on something,
-              // or we're in websocket upgrade mode (which requires an await). These two things can happen in either order.
-              let rx = with_promise_mut(index, |promise| {
-                match *promise {
-                  PromiseState::None => {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    *promise = PromiseState::Waiting(tx);
-                    return Some(rx);
-                  }
-                  PromiseState::Resolved => {
-                    return None;
-                  }
-                  PromiseState::Waiting(_) => {
-                    // TODO(mmastrac): error
-                    return None;
-                  }
-                }
-              });
-              println!("waker.waker");
-              self.op_state.borrow().waker.wake();
-              if let Some(rx) = rx {
-                return CallbackResult::PendingPromise(rx);
-              }
-            }
-          };
-        }
-      }
-      CallbackResult::Ready
-    })
-  }
-}
-
-impl HttpCallbackTrait for HttpCallback {
-  fn process_request(&self, index: usize) -> HttpCallbackFuture {
-    let result = self.v8_sync_call(index);
-
-    match result {
-      CallbackResult::PendingPromise(rx) => {
-        return HttpCallbackFuture::PromisePending(index, rx);
-      }
-      CallbackResult::Ready => {
-        return HttpCallbackFuture::Ready(index);
-      }
-    }
+  pub fn process_request(&self, index: usize) -> HttpCallbackFuture {
+    println!("process {}", index);
+    let rx = with_promise_mut(index, |promise| {
+      let (tx, rx) = tokio::sync::oneshot::channel();
+      *promise = PromiseState::Waiting(tx);
+      rx
+    });
+    HttpCallbackFuture::PromisePending(index, rx)
   }
 }
 
@@ -688,7 +627,9 @@ impl Resource for HttpResponseBody {
     Box::pin(async move {
       println!("write");
       let nwritten = buf.len();
-      clone.0.borrow().as_ref().unwrap().send(buf).await.map_err(|_| bad_resource("failed to write"))?;
+      let res = clone.0.borrow().as_ref().unwrap().send(buf).await;
+      println!("write! {:?}", res.is_ok());
+      res.map_err(|_| bad_resource("failed to write"))?;
       println!("write!");
       Ok(WriteOutcome::Full { nwritten })
     })
@@ -766,7 +707,7 @@ pub fn op_set_response_body_stream(
   index: usize,
 ) -> Result<ResourceId, AnyError> {
   // TODO(mmastrac): what should this channel size be?
-  let (tx, rx) = tokio::sync::mpsc::channel(8);
+  let (tx, rx) = tokio::sync::mpsc::channel(1);
   with_resp_mut(index, move |response| {
     *response.as_mut().unwrap().body_mut() = ResponseBytes(ResponseBytesInner::V8Stream(index, rx));
   });
@@ -811,18 +752,20 @@ pub async fn op_http_track(state: Rc<RefCell<OpState>>, index: usize, server_rid
   let res = rx.map(|e| match e {
     Err(e) => Err(AnyError::from(e)),
     Ok(Err(e)) => Err(AnyError::from(e)),
-    Ok(Ok(x)) => Ok(x)
+    Ok(Ok(true)) => Ok(()),
+    Ok(Ok(false)) => Err(AnyError::msg("failed to write entire stream"))
   }).try_or_cancel(cancel_handle).await;
 
-  println!("tracked");
+  println!("tracked {:?}", res);
 
   res
 }
 
-fn serve_http<HC: HttpCallbackTrait>(
+fn serve_http(
   io: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-  http_callback: HC,
+  http_callback: HttpCallback,
   cancel: Rc<CancelHandle>,
+  tx: tokio::sync::mpsc::Sender<usize>,
 ) -> JoinHandle<Result<(), AnyError>> {
   // TODO(mmastrac): This is faster if we can use tokio::spawn but then the send bounds get us
   let safe_future = SafeFutureForSingleThread(Box::pin(async {
@@ -832,7 +775,16 @@ fn serve_http<HC: HttpCallbackTrait>(
         io,
         service_fn(move |req| {
           let index = slab_insert(req);
-          http_callback.process_request(index)
+          let tx = tx.clone();
+          async move {
+            let rx = with_promise_mut(index, |promise| {
+              let (tx, rx) = tokio::sync::oneshot::channel();
+              *promise = PromiseState::Waiting(tx);
+              rx
+            });
+            tx.send(index).await.unwrap();
+            HttpCallbackFuture::PromisePending(index, rx).await
+          }
         }),
       )
       .with_upgrades()
@@ -845,19 +797,20 @@ fn serve_http<HC: HttpCallbackTrait>(
   spawn_local(safe_future)
 }
 
-fn serve_http_on<HC: HttpCallbackTrait>(
+fn serve_http_on(
   network_stream: NetworkStream,
-  http_callback: HC,
+  http_callback: HttpCallback,
   cancel: Rc<CancelHandle>,
+  tx: tokio::sync::mpsc::Sender<usize>,
 ) -> JoinHandle<Result<(), AnyError>> {
   match network_stream {
-    NetworkStream::Tcp(conn) => serve_http(conn, http_callback, cancel),
-    NetworkStream::Tls(conn) => serve_http(conn, http_callback, cancel),
-    NetworkStream::Unix(conn) => serve_http(conn, http_callback, cancel),
+    NetworkStream::Tcp(conn) => serve_http(conn, http_callback, cancel, tx),
+    NetworkStream::Tls(conn) => serve_http(conn, http_callback, cancel, tx),
+    NetworkStream::Unix(conn) => serve_http(conn, http_callback, cancel, tx),
   }
 }
 
-struct HttpJoinHandle(RefCell<Option<JoinHandle<Result<(), AnyError>>>>, Rc<CancelHandle>);
+struct HttpJoinHandle(RefCell<Option<JoinHandle<Result<(), AnyError>>>>, Rc<CancelHandle>, RefCell<tokio::sync::mpsc::Receiver<usize>>);
 
 impl Resource for HttpJoinHandle {
   fn name(&self) -> Cow<str> {
@@ -876,7 +829,6 @@ pub fn op_serve_http<'scope>(
   state: Rc<RefCell<OpState>>,
   listener_rid: ResourceId,
   init_cb: Value<'scope>,
-  cb: Value<'scope>,
 ) -> Result<ResourceId, AnyError> {
   let listener = take_network_stream_listener_resource(
     &mut state.borrow_mut().resource_table,
@@ -890,24 +842,17 @@ pub fn op_serve_http<'scope>(
   let url = v8::String::new(scope, fallback_base_url.as_str()).unwrap();
   init_callback.call(scope, recv.into(), &[url.into()]);
 
-  let callback = v8::Local::<v8::Function>::try_from(cb.v8_value)?;
-
-  // SAFETY: We know this JsCallback won't outlive the isolate
-  let callback = Rc::new(unsafe {
-    JsCallback::new(scope, scope.get_current_context(), callback)
-  });
-
   let http_callback = HttpCallback {
     op_state: state.clone(),
-    callback,
   };
 
   let cancel = Rc::new(CancelHandle::new());
+  let (tx, rx) = tokio::sync::mpsc::channel(10);
   // TODO(mmastrac): Cancel handle makes this !send
   let cancel_clone = cancel.clone();
   let handle = spawn_local(SafeFutureForSingleThread(Box::pin(async move {
     loop {
-      serve_http_on(listener.accept().await?, http_callback.clone(), cancel_clone.clone());
+      serve_http_on(listener.accept().await?, http_callback.clone(), cancel_clone.clone(), tx.clone());
     }
     // TODO(mmastrac): We need to listen for the abort signal
     #[allow(unreachable_code)]
@@ -918,7 +863,7 @@ pub fn op_serve_http<'scope>(
     state
       .borrow_mut()
       .resource_table
-      .add(HttpJoinHandle(RefCell::new(Some(handle)), cancel)),
+      .add(HttpJoinHandle(RefCell::new(Some(handle)), cancel, RefCell::new(rx))),
   )
 }
 
@@ -928,7 +873,6 @@ pub fn op_serve_http_on<'scope>(
   state: Rc<RefCell<OpState>>,
   conn: ResourceId,
   init_cb: Value<'scope>,
-  cb: Value<'scope>,
 ) -> Result<ResourceId, AnyError> {
   let network_stream = take_network_stream_resource(
     &mut (&mut *state.borrow_mut()).resource_table,
@@ -942,25 +886,18 @@ pub fn op_serve_http_on<'scope>(
   let url = v8::String::new(scope, fallback_base_url.as_str()).unwrap();
   init_callback.call(scope, recv.into(), &[url.into()]);
 
-  let callback = v8::Local::<v8::Function>::try_from(cb.v8_value)?;
-
-  // SAFETY: We know this JsCallback won't outlive the isolate
-  let callback = Rc::new(unsafe {
-    JsCallback::new(scope, scope.get_current_context(), callback)
-  });
-
   let http_callback = HttpCallback {
     op_state: state.clone(),
-    callback,
   };
 
   let cancel = Rc::new(CancelHandle::new());
-  let handle = serve_http_on(network_stream, http_callback, cancel.clone());
+  let (tx, rx) = tokio::sync::mpsc::channel(10);
+  let handle = serve_http_on(network_stream, http_callback, cancel.clone(), tx);
   Ok(
     state
       .borrow_mut()
       .resource_table
-      .add(HttpJoinHandle(RefCell::new(Some(handle)), cancel)),
+      .add(HttpJoinHandle(RefCell::new(Some(handle)), cancel, RefCell::new(rx))),
   )
 }
 
@@ -968,28 +905,56 @@ pub fn op_serve_http_on<'scope>(
 pub async fn op_http_wait(
   state: Rc<RefCell<OpState>>,
   rid: ResourceId,
-) -> Result<(), AnyError> {
+) -> Result<u32, AnyError> {
   let handle = state
     .borrow_mut()
     .resource_table
     .get::<HttpJoinHandle>(rid)?;
-  let res = handle.0.borrow_mut().take().unwrap().await?;
 
-  // Drop the cancel and join handles
-  state.borrow_mut().resource_table.take::<HttpJoinHandle>(rid)?;
+  println!("wait");
+  let mut recv = handle.2.borrow_mut();
+  match recv.recv().await {
+    None => {
+      let res = handle.0.borrow_mut().take().unwrap().await?;
 
-  // Filter out shutdown errors
-  if let Err(ref err) = res {
-    if let Some(err) = err.source() {
-      if let Some(err) = err.downcast_ref::<io::Error>() {
-        if err.kind() == io::ErrorKind::NotConnected {
-          return Ok(());
+      // Drop the cancel and join handles
+      state.borrow_mut().resource_table.take::<HttpJoinHandle>(rid)?;
+
+      // Filter out shutdown errors
+      if let Err(err) = res {
+        if let Some(err) = err.source() {
+          if let Some(err) = err.downcast_ref::<io::Error>() {
+            if err.kind() == io::ErrorKind::NotConnected {
+              return Ok(u32::MAX);
+            }
+          }
         }
+        return Err(err);
       }
+      return Ok(u32::MAX);
+    }
+    Some(req) => {
+      return Ok(req as u32);
     }
   }
 
-  res
+  // let res = handle.0.borrow_mut().take().unwrap().await?;
+
+  // // Drop the cancel and join handles
+  // state.borrow_mut().resource_table.take::<HttpJoinHandle>(rid)?;
+
+  // // Filter out shutdown errors
+  // if let Err(ref err) = res {
+  //   if let Some(err) = err.source() {
+  //     if let Some(err) = err.downcast_ref::<io::Error>() {
+  //       if err.kind() == io::ErrorKind::NotConnected {
+  //         return Ok(());
+  //       }
+  //     }
+  //   }
+  // }
+
+  // res
 }
 
 #[cfg(test)]
