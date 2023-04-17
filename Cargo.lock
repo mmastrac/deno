@@ -1066,6 +1066,7 @@ dependencies = [
  "ring",
  "serde",
  "slab",
+ "thiserror",
  "tokio",
  "tokio-util",
 ]

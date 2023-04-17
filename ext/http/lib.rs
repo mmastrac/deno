@@ -75,6 +75,7 @@ use crate::reader_stream::ExternallyAbortableReaderStream;
 use crate::reader_stream::ShutdownHandle;
 
 pub mod compressible;
+mod handoff;
 mod http2;
 mod js_callback;
 mod reader_stream;
