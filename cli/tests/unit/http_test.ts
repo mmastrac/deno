@@ -14,6 +14,7 @@ import {
   fail,
 } from "./test_util.ts";
 import { join } from "../../../test_util/std/path/mod.ts";
+import { consoleSize } from "../../../runtime/js/40_tty.js";
 
 const {
   buildCaseInsensitiveCommaValueFinder,
@@ -116,7 +117,7 @@ Deno.test(
     const promise = (async () => {
       const listener = Deno.listen({ port: 2334 });
       const conn = await listener.accept();
-      // listener.close();
+      listener.close();
       const httpConn = Deno.serveHttp(conn);
       const e = await httpConn.nextRequest();
       assert(e);
@@ -255,8 +256,11 @@ Deno.test(
       const evt = await httpConn.nextRequest();
       assert(evt);
       const { request, respondWith } = evt;
+      console.log(0);
       const reqBody = await request.text();
+      console.log(1);
       assertEquals("hello world", reqBody);
+      console.log(2);
       await respondWith(new Response(""));
 
       // // TODO(ry) If we don't call httpConn.nextRequest() here we get "error sending
@@ -268,7 +272,7 @@ Deno.test(
     })();
 
     const resp = await fetch("http://127.0.0.1:4501/", {
-      body: stream.readable,
+      body: "hello world",
       method: "POST",
       headers: { "connection": "close" },
     });

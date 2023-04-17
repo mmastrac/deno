@@ -9,6 +9,7 @@ use std::io;
 use std::ops::DerefMut;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use deno_core::CancelHandle;
@@ -49,6 +50,7 @@ use hyper1::server::conn::http1;
 use hyper1::service::service_fn;
 use hyper1::StatusCode;
 use slab::Slab;
+use tokio::task::LocalSet;
 use tokio::task::spawn_local;
 use tokio::task::JoinHandle;
 
@@ -260,6 +262,17 @@ trait HttpCallbackTrait: Clone + Send + 'static {
 
 unsafe impl Send for HttpCallback {}
 unsafe impl Sync for HttpCallback {}
+
+struct SafeFutureForSingleThread<F: Future<Output = O> + Unpin, O> (F);
+
+impl <F: Future<Output = O> + Unpin, O> Future for SafeFutureForSingleThread<F, O> {
+  type Output = O;
+  fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+    self.0.poll_unpin(cx)      
+  }
+}
+
+unsafe impl <F: Future<Output = O> + Unpin, O> Send for SafeFutureForSingleThread<F, O> {}
 
 enum CallbackResult {
   Ready,
@@ -604,6 +617,7 @@ impl Stream for ReadFuture {
     with_req_mut(self.0, |req| {
       match Pin::new(req).poll_frame(cx) {
         std::task::Poll::Ready(Some(Ok(frame))) => {
+          println!("frame");
           if let Ok(data) = frame.into_data() {
             // Ensure that we never yield an empty frame
             if !data.is_empty() {
@@ -624,17 +638,23 @@ struct HttpRequestBody(RefCell<Peekable<ReadFuture>>);
 impl HttpRequestBody {
   async fn read(self: Rc<Self>, limit: usize) -> Result<BufView, AnyError> {
     let mut peekable = self.0.borrow_mut();
-    match Pin::new(&mut *peekable).peek_mut().await {
+    println!("peek");
+    let res = Pin::new(&mut *peekable).peek_mut().await;
+    println!("peek {:?}", res);
+    match res {
       None => return Ok(BufView::empty()),
       Some(Err(_)) => {
         return Err(peekable.next().await.unwrap().err().unwrap())
       }
       Some(Ok(bytes)) => {
+        println!("bytes");
         if bytes.len() <= limit {
+          println!("bytes!");
           // We can safely take the next item since we peeked it
           return Ok(BufView::from(peekable.next().await.unwrap()?));
         }
 
+        println!("bytes split");
         let ret = bytes.split_to(limit);
         return Ok(BufView::from(ret));
       }
@@ -678,6 +698,7 @@ impl Resource for HttpResponseBody {
 
 #[op]
 pub fn op_read_request_body(state: &mut OpState, index: usize) -> ResourceId {
+  println!("body");
   let body_resource = Rc::new(HttpRequestBody(RefCell::new(ReadFuture(index).peekable())));
   let res = state.resource_table.add_rc(body_resource.clone());
   with_body_mut(index, |body| {
@@ -797,10 +818,10 @@ pub async fn op_http_track(state: Rc<RefCell<OpState>>, index: usize, server_rid
 fn serve_http<HC: HttpCallbackTrait>(
   io: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
   http_callback: HC,
-  cancel: Rc<CancelHandle>
+  cancel: Rc<CancelHandle>,
 ) -> JoinHandle<Result<(), AnyError>> {
   // TODO(mmastrac): This is faster if we can use tokio::spawn but then the send bounds get us
-  spawn_local(async {
+  let safe_future = SafeFutureForSingleThread(Box::pin(async {
     let res = http1::Builder::new()
       .keep_alive(true)
       .serve_connection(
@@ -816,7 +837,8 @@ fn serve_http<HC: HttpCallbackTrait>(
       .await;
 
     res
-  })
+  }));
+  tokio::spawn(safe_future)
 }
 
 fn serve_http_on<HC: HttpCallbackTrait>(
@@ -879,14 +901,14 @@ pub fn op_serve_http<'scope>(
   let cancel = Rc::new(CancelHandle::new());
   // TODO(mmastrac): Cancel handle makes this !send
   let cancel_clone = cancel.clone();
-  let handle = spawn_local(async move {
+  let handle = tokio::spawn(SafeFutureForSingleThread(Box::pin(async move {
     loop {
       serve_http_on(listener.accept().await?, http_callback.clone(), cancel_clone.clone());
     }
     // TODO(mmastrac): We need to listen for the abort signal
     #[allow(unreachable_code)]
     Ok::<_, AnyError>(())
-  });
+  })));
 
   Ok(
     state
