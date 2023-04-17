@@ -160,7 +160,7 @@ class HttpConn {
           conn[0](resp);
           console.log("responded");
           // Return a promise tracking the state of the response
-          return conn[2]();
+          return conn[2];
         } };
       }
       const wakeup = new Promise(r => this.#waiters.push(r));
@@ -477,25 +477,25 @@ function return_response(req, innerResp) {
 }
 
 
-function fastSyncResponse(req, respBody) {
+function fastSyncResponseOrStream(req, respBody) {
   if (respBody === null || respBody === undefined) {
-    core.ops.op_set_response_body_text(req, "");
-    return true;
+    // Don't set the body
+    return null;
   }
 
-  const body = respBody.streamOrStatic.body;
+  const stream = respBody.streamOrStatic;
+  const body = stream.body;
+  
   if (ObjectPrototypeIsPrototypeOf(Uint8ArrayPrototype, body)) {
     core.ops.op_set_response_body_bytes(req, body.buffer);
-    return true;
-  } else if (typeof body === "string") {
-    core.ops.op_set_response_body_text(req, body);
-    return true;
+    return null;
   }
-  return false;
-}
+  
+  if (typeof body === "string") {
+    core.ops.op_set_response_body_text(req, body);
+    return null;
+  }
 
-async function asyncResponse(req, respBody) {
-  const stream = respBody.streamOrStatic;
   // At this point in the response it needs to be a stream
   if (!ObjectPrototypeIsPrototypeOf(ReadableStreamPrototype, stream)) {
     throw TypeError("invalid response");
@@ -503,34 +503,39 @@ async function asyncResponse(req, respBody) {
   const resourceBacking = getReadableStreamResourceBacking(stream);
   if (resourceBacking) {
     core.ops.op_set_response_body_resource(req, resourceBacking.rid, resourceBacking.autoClose);
-  } else {
-    console.log("stm");
-    const responseRid = core.ops.op_set_response_body_stream(req);
-    console.log("stm", responseRid);
-    const reader = stream.getReader();
-    const responseStream = writableStreamForRid(responseRid, true);
-    const writer = responseStream.getWriter();
-    core.ops.op_set_promise_complete(req, 200);
-    try {
-      while (true) {
-        console.log("reading");
-        const { value, done } = await reader.read();
-        console.log("read", value, done);
-        if (done) {
-          break;
-        }
-        await writer.write(value);
-      }
-    } catch (error) {
-      await reader.cancel(error);
-      console.log(e);
-    } finally {
-      writer.releaseLock();
-      reader.releaseLock();
-    }
-    responseStream.close();
-    console.log("stm");
+    return null;
   }
+
+  return stream;
+}
+
+async function asyncResponse(req, stream) {
+  console.log("stm");
+  const responseRid = core.ops.op_set_response_body_stream(req);
+  console.log("stm", responseRid);
+  const reader = stream.getReader();
+  const responseStream = writableStreamForRid(responseRid, true);
+  const writer = responseStream.getWriter();
+  core.ops.op_set_promise_complete(req, 200);
+  try {
+    while (true) {
+      console.log("reading");
+      const { value, done } = await reader.read();
+      console.log("read", value, done);
+      if (done) {
+        break;
+      }
+      await writer.write(value);
+    }
+  } catch (error) {
+    await reader.cancel(error);
+    console.log(e);
+  } finally {
+    writer.releaseLock();
+    reader.releaseLock();
+  }
+  responseStream.close();
+  console.log("stm");
 }
 
 function map_to_userland(requests, context, callback, wantsPromise, onError) {
@@ -538,68 +543,38 @@ function map_to_userland(requests, context, callback, wantsPromise, onError) {
     const innerRequest = new InnerRequest(req, context.fallback_base_url);
     requests.add(innerRequest);
     const request = fromInnerRequest(innerRequest, "immutable");
-    const response = callback(request, wantsPromise ? (async () => { 
-      try { 
-        await core.opAsync("op_http_track", req, context.server_rid) 
-      } catch (e) { 
-        throw new Deno.errors.Http(e) 
-      } 
-    }) : undefined);
-    // TODO: Detect promises better
-    // TODO: Some response types are faster when we send them to ops, some are faster when we return them
-    if (response.then) {
-      // If the callback is a promise, wrap it in another promise where we can do the response serving
-      // magic.
-      return (async () => {
-        try {
-          // TODO(mmastrac): Code is duplicated between async/sync paths for now -- check perf if we extract it to a function
-          const awaited_response = await response;
-          const inner = toInnerResponse(awaited_response);
-          const headers = inner.headerList;
-          if (headers && headers.length > 0) {
-            if (headers.length == 1) {
-              core.ops.op_set_response_header(req, headers[0][0], headers[0][1]);
-            } else {
-              core.ops.op_set_response_headers(req, headers);
-            }
+    const response = callback(request, wantsPromise ? core.opAsync("op_http_track", req, context.server_rid) : undefined);
+    return (async () => {
+      try {
+        const inner = toInnerResponse(await response);
+
+        const headers = inner.headerList;
+        if (headers && headers.length > 0) {
+          if (headers.length == 1) {
+            core.ops.op_set_response_header(req, headers[0][0], headers[0][1]);
+          } else {
+            core.ops.op_set_response_headers(req, headers);
           }
-          console.log(1);
-          console.log(inner.body);
-          if (!fastSyncResponse(req, inner.body)) {
-            console.log(2);
-            await asyncResponse(req, inner.body);
-          }
+        }
+        console.log(1);
+        console.log(inner.body);
+        const stream = fastSyncResponseOrStream(req, inner.body);
+        if (stream !== null) {
+          console.log(2);
+          await asyncResponse(req, stream);
+        } else {
           console.log(3);
           core.ops.op_set_promise_complete(req, 200);
-          console.log(4);
-          requests.delete(innerRequest);
-          console.log(5);
-          innerRequest.close();
-          console.log(6);
-        } catch (e) {
-          onError(e);
         }
-      })();
-    } else {
-      const inner = toInnerResponse(response);
-      const headers = inner.headerList;
-      if (headers && headers.length > 0) {
-        if (headers.length == 1) {
-          core.ops.op_set_response_header(req, headers[0][0], headers[0][1]);
-        } else {
-          core.ops.op_set_response_headers(req, headers);
-        }
+        console.log(4);
+        requests.delete(innerRequest);
+        console.log(5);
+        innerRequest.close();
+        console.log(6);
+      } catch (e) {
+        onError(e);
       }
-      if (!fastSyncResponse(req, inner.body)) {
-        // The response is not synchronous, so we're going to have to return a promise
-        // TODO(mmastrac)
-      }
-
-      // Return undefined to use the body we're building
-      requests.delete(innerRequest);
-      innerRequest.close();
-      return;
-    }
+    })();
   }
 }
 

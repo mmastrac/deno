@@ -2,6 +2,7 @@
 //! case. The callback may be synchronous or asynchronous, however, and we determine this by looking at the return
 //! value -- it is either a promise or not.
 
+use std::backtrace::Backtrace;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::future::Future;
@@ -11,6 +12,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 use bytes::Bytes;
+use deno_core::CancelFuture;
 use deno_core::CancelHandle;
 use deno_core::WriteOutcome;
 use deno_core::error::bad_resource;
@@ -51,6 +53,9 @@ use slab::Slab;
 use tokio::task::spawn_local;
 use tokio::task::JoinHandle;
 
+use crate::response::ResponseBytes;
+use crate::response::ResponseBytesInner;
+
 type Request = hyper1::Request<Incoming>;
 type Response = hyper1::Response<ResponseBytes>;
 
@@ -62,13 +67,13 @@ enum PromiseState {
   Resolved,
 }
 
+
 pub struct HttpPair {
   request: Request,
   // The response may get taken before we tear this down
   response: Option<Response>,
   body: Option<Rc<HttpRequestBody>>,
   promise: PromiseState,
-  tracker: Option<tokio::sync::oneshot::Sender<Result<bool, AnyError>>>,
 }
 
 thread_local! {
@@ -111,150 +116,17 @@ with!(
   http.promise
 );
 with!(with_http, with_http_mut, HttpPair, http, http);
-with!(with_tracker, with_tracker_mut, Option<tokio::sync::oneshot::Sender<Result<bool, AnyError>>>, http, http.tracker);
 
 fn slab_insert(request: Request) -> usize {
   SLAB.with(|slab| {
     slab.borrow_mut().insert(HttpPair {
       request,
-      response: Some(Response::new(Default::default())),
+      response: Some(Response::new(ResponseBytes::default())),
       body: None,
       promise: PromiseState::default(),
-      tracker: None,
     })
   })
 }
-
-#[derive(Default)]
-enum ResponseBytesInner {
-  /// A completed stream.
-  #[default]
-  Done,
-  /// A static buffer of bytes, sent it one fell swoop.
-  Bytes(usize, BufView),
-  /// A resource stream, piped in fast mode.
-  Resource(usize, bool, Rc<dyn Resource>, AsyncResult<BufView>),
-  /// A JS-backed stream, written in JS and transported via pipe.
-  V8Stream(usize, tokio::sync::mpsc::Receiver<BufView>),
-}
-
-#[derive(Default)]
-struct ResponseBytes(ResponseBytesInner);
-
-impl ResponseBytesInner {
-  pub fn len(&self) -> Option<usize> {
-    match self {
-      Self::Done => Some(0),
-      Self::Bytes(_, bytes) => Some(bytes.len()),
-      Self::Resource(..) => None,
-      Self::V8Stream(..) => None,
-    }
-  }
-
-  pub fn finalize(&mut self, success: bool) -> ResponseBytesInner {
-    println!("finalize");
-    let current = std::mem::take(self);
-    let index = match current {
-      Self::Done => None,
-      Self::Bytes(index, _) => {
-        Some(index)
-      },
-      Self::Resource(index, ..) => {
-        Some(index)
-      },
-      Self::V8Stream(index, ..) => {
-        Some(index)
-      }
-    };
-    if let Some(index) = index {
-      println!("wakeup");
-      with_tracker_mut(index, |tracker| tracker.take().map(|t| t.send(Ok(success)).unwrap()));
-      SLAB.with(|slab| slab.borrow_mut().remove(index));
-      println!("wokeup");
-    }
-    current
-  }
-}
-
-impl Body for ResponseBytes {
-  type Data = BufView;
-  type Error = AnyError;
-
-  fn poll_frame(
-    mut self: Pin<&mut Self>,
-    cx: &mut std::task::Context<'_>,
-  ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-    match &mut self.0 {
-      ResponseBytesInner::Done => std::task::Poll::Ready(None),
-      ResponseBytesInner::Bytes(..) => {
-        if let ResponseBytesInner::Bytes(_, data) = self.0.finalize(true) {
-          std::task::Poll::Ready(Some(Ok(Frame::data(data))))
-        } else {
-          unreachable!()
-        }
-      },
-      ResponseBytesInner::Resource(index, auto_close, stm, ref mut future) => {
-        match future.poll_unpin(cx) {
-          std::task::Poll::Pending => return std::task::Poll::Pending,
-          std::task::Poll::Ready(Err(err)) => {
-            return std::task::Poll::Ready(Some(Err(err)));
-          }
-          std::task::Poll::Ready(Ok(buf)) => {
-            if buf.is_empty() {
-              if *auto_close {
-                stm.clone().close();
-              }
-              return std::task::Poll::Ready(None);
-            }
-            // Re-arm the future
-            *future = stm.clone().read(64 * 1024);
-            std::task::Poll::Ready(Some(Ok(Frame::data(buf))))
-          }
-        }
-      }
-      ResponseBytesInner::V8Stream(index, stm) => {
-        println!("stream");
-        match stm.poll_recv(cx) {
-          std::task::Poll::Pending => std::task::Poll::Pending,
-          std::task::Poll::Ready(Some(buf)) => {
-            println!("ready");
-            std::task::Poll::Ready(Some(Ok(Frame::data(BufView::from(buf)))))
-          },
-          std::task::Poll::Ready(None) => {
-            self.0.finalize(true);
-            return std::task::Poll::Ready(None);
-          }
-        }
-      }
-    }
-  }
-
-  fn is_end_stream(&self) -> bool {
-    matches!(self.0, ResponseBytesInner::Done)
-  }
-
-  fn size_hint(&self) -> SizeHint {
-    if let Some(size) = self.0.len() {
-      SizeHint::with_exact(size as u64)
-    } else {
-      SizeHint::default()
-    }
-  }
-}
-
-impl Drop for ResponseBytes {
-  fn drop(&mut self) {
-    self.0.finalize(false);
-  }
-}
-
-#[derive(Clone)]
-struct HttpCallback {
-  pub op_state: Rc<RefCell<OpState>>,
-}
-
-unsafe impl Send for HttpCallback {}
-unsafe impl Sync for HttpCallback {}
 
 struct SafeFutureForSingleThread<F: Future<Output = O> + Unpin, O> (F);
 
@@ -266,11 +138,6 @@ impl <F: Future<Output = O> + Unpin, O> Future for SafeFutureForSingleThread<F, 
 }
 
 unsafe impl <F: Future<Output = O> + Unpin, O> Send for SafeFutureForSingleThread<F, O> {}
-
-enum CallbackResult {
-  Ready,
-  PendingPromise(tokio::sync::oneshot::Receiver<()>),
-}
 
 /// The HTTP callback into v8 may require resolution of a promise.
 enum HttpCallbackFuture {
@@ -303,24 +170,13 @@ impl Future for HttpCallbackFuture {
         return std::task::Poll::Pending;
       }
     };
+    println!("res {:?}", res);
     match res {
       std::task::Poll::Pending => std::task::Poll::Pending,
       std::task::Poll::Ready(index) => std::task::Poll::Ready(Ok(
         with_http_mut(index, |http| http.response.take().unwrap()),
       )),
     }
-  }
-}
-
-impl HttpCallback {
-  pub fn process_request(&self, index: usize) -> HttpCallbackFuture {
-    println!("process {}", index);
-    let rx = with_promise_mut(index, |promise| {
-      let (tx, rx) = tokio::sync::oneshot::channel();
-      *promise = PromiseState::Waiting(tx);
-      rx
-    });
-    HttpCallbackFuture::PromisePending(index, rx)
   }
 }
 
@@ -695,7 +551,7 @@ pub fn op_set_response_body_resource(
 
   with_resp_mut(index, move |response| {
     let future = resource.clone().read(64 * 1024);
-    *response.as_mut().unwrap().body_mut() = ResponseBytes(ResponseBytesInner::Resource(index, auto_close, resource, future));
+    response.as_mut().unwrap().body_mut().initialize(ResponseBytesInner::Resource(auto_close, resource, future));
   });
 
   Ok(())
@@ -709,7 +565,7 @@ pub fn op_set_response_body_stream(
   // TODO(mmastrac): what should this channel size be?
   let (tx, rx) = tokio::sync::mpsc::channel(1);
   with_resp_mut(index, move |response| {
-    *response.as_mut().unwrap().body_mut() = ResponseBytes(ResponseBytesInner::V8Stream(index, rx));
+    response.as_mut().unwrap().body_mut().initialize(ResponseBytesInner::V8Stream(rx));
   });
 
   Ok(state.resource_table.add(HttpResponseBody(RefCell::new(Some(tx)))))
@@ -717,29 +573,30 @@ pub fn op_set_response_body_stream(
 
 #[op]
 pub fn op_set_response_body_text(index: usize, text: String) {
-  println!("body text");
-  with_resp_mut(index, move |response| {
-    *response.as_mut().unwrap().body_mut() =
-      ResponseBytes(ResponseBytesInner::Bytes(index, BufView::from(text.into_bytes())))
-  });
+  println!("body text {index} '{text}'");
+  if !text.is_empty() {
+    with_resp_mut(index, move |response| {
+      response.as_mut().unwrap().body_mut().initialize(ResponseBytesInner::Bytes(BufView::from(text.into_bytes())))
+    });
+  }
   println!("body text done");
 }
 
 #[op]
 pub fn op_set_response_body_bytes(index: usize, buffer: ZeroCopyBuf) {
-  with_resp_mut(index, |response| {
-    *response.as_mut().unwrap().body_mut() = ResponseBytes(ResponseBytesInner::Bytes(index, BufView::from(buffer)))
-  });
+  if !buffer.is_empty() {
+    with_resp_mut(index, |response| {
+      response.as_mut().unwrap().body_mut().initialize(ResponseBytesInner::Bytes(BufView::from(buffer)))
+    });
+  };
 }
 
 #[op]
 pub async fn op_http_track(state: Rc<RefCell<OpState>>, index: usize, server_rid: ResourceId) -> Result<(), AnyError> {
-  let (tx, rx) = tokio::sync::oneshot::channel();
-
   println!("track write");
 
-  with_tracker_mut(index, |tracker| {
-    *tracker = Some(tx);
+  let handle = with_resp(index, |resp| {
+    resp.as_ref().unwrap().body().completion_handle()
   });
 
   let cancel_handle = state
@@ -747,14 +604,13 @@ pub async fn op_http_track(state: Rc<RefCell<OpState>>, index: usize, server_rid
     .resource_table
     .get::<HttpJoinHandle>(server_rid)?.1.clone();
 
-    println!("track");
+  println!("track");
 
-  let res = rx.map(|e| match e {
-    Err(e) => Err(AnyError::from(e)),
-    Ok(Err(e)) => Err(AnyError::from(e)),
-    Ok(Ok(true)) => Ok(()),
-    Ok(Ok(false)) => Err(AnyError::msg("failed to write entire stream"))
-  }).try_or_cancel(cancel_handle).await;
+  let res = match handle.or_cancel(cancel_handle).await {
+    Ok(true) => Ok(()),
+    Ok(false) => Err(AnyError::msg("failed to write entire stream")),
+    Err(e) => Ok(()),
+  };
 
   println!("tracked {:?}", res);
 
@@ -763,7 +619,6 @@ pub async fn op_http_track(state: Rc<RefCell<OpState>>, index: usize, server_rid
 
 fn serve_http(
   io: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-  http_callback: HttpCallback,
   cancel: Rc<CancelHandle>,
   tx: tokio::sync::mpsc::Sender<usize>,
 ) -> JoinHandle<Result<(), AnyError>> {
@@ -783,7 +638,9 @@ fn serve_http(
               rx
             });
             tx.send(index).await.unwrap();
-            HttpCallbackFuture::PromisePending(index, rx).await
+            let resp = HttpCallbackFuture::PromisePending(index, rx).await;
+            println!("{:?}", resp);
+            resp
           }
         }),
       )
@@ -799,14 +656,13 @@ fn serve_http(
 
 fn serve_http_on(
   network_stream: NetworkStream,
-  http_callback: HttpCallback,
   cancel: Rc<CancelHandle>,
   tx: tokio::sync::mpsc::Sender<usize>,
 ) -> JoinHandle<Result<(), AnyError>> {
   match network_stream {
-    NetworkStream::Tcp(conn) => serve_http(conn, http_callback, cancel, tx),
-    NetworkStream::Tls(conn) => serve_http(conn, http_callback, cancel, tx),
-    NetworkStream::Unix(conn) => serve_http(conn, http_callback, cancel, tx),
+    NetworkStream::Tcp(conn) => serve_http(conn, cancel, tx),
+    NetworkStream::Tls(conn) => serve_http(conn, cancel, tx),
+    NetworkStream::Unix(conn) => serve_http(conn, cancel, tx),
   }
 }
 
@@ -842,17 +698,13 @@ pub fn op_serve_http<'scope>(
   let url = v8::String::new(scope, fallback_base_url.as_str()).unwrap();
   init_callback.call(scope, recv.into(), &[url.into()]);
 
-  let http_callback = HttpCallback {
-    op_state: state.clone(),
-  };
-
   let cancel = Rc::new(CancelHandle::new());
   let (tx, rx) = tokio::sync::mpsc::channel(10);
   // TODO(mmastrac): Cancel handle makes this !send
   let cancel_clone = cancel.clone();
   let handle = spawn_local(SafeFutureForSingleThread(Box::pin(async move {
     loop {
-      serve_http_on(listener.accept().await?, http_callback.clone(), cancel_clone.clone(), tx.clone());
+      serve_http_on(listener.accept().await?, cancel_clone.clone(), tx.clone());
     }
     // TODO(mmastrac): We need to listen for the abort signal
     #[allow(unreachable_code)]
@@ -886,13 +738,9 @@ pub fn op_serve_http_on<'scope>(
   let url = v8::String::new(scope, fallback_base_url.as_str()).unwrap();
   init_callback.call(scope, recv.into(), &[url.into()]);
 
-  let http_callback = HttpCallback {
-    op_state: state.clone(),
-  };
-
   let cancel = Rc::new(CancelHandle::new());
   let (tx, rx) = tokio::sync::mpsc::channel(10);
-  let handle = serve_http_on(network_stream, http_callback, cancel.clone(), tx);
+  let handle = serve_http_on(network_stream, cancel.clone(), tx);
   Ok(
     state
       .borrow_mut()

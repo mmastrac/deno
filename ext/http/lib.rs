@@ -79,6 +79,7 @@ mod handoff;
 mod http2;
 mod js_callback;
 mod reader_stream;
+mod response;
 mod websocket_upgrade;
 
 deno_core::extension!(
