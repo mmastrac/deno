@@ -356,6 +356,7 @@ impl HttpCallback {
                   }
                 }
               });
+              println!("waker.waker");
               self.op_state.borrow().waker.wake();
               if let Some(rx) = rx {
                 return CallbackResult::PendingPromise(rx);
@@ -841,7 +842,7 @@ fn serve_http<HC: HttpCallbackTrait>(
 
     res
   }));
-  tokio::spawn(safe_future)
+  spawn_local(safe_future)
 }
 
 fn serve_http_on<HC: HttpCallbackTrait>(
@@ -904,7 +905,7 @@ pub fn op_serve_http<'scope>(
   let cancel = Rc::new(CancelHandle::new());
   // TODO(mmastrac): Cancel handle makes this !send
   let cancel_clone = cancel.clone();
-  let handle = tokio::spawn(SafeFutureForSingleThread(Box::pin(async move {
+  let handle = spawn_local(SafeFutureForSingleThread(Box::pin(async move {
     loop {
       serve_http_on(listener.accept().await?, http_callback.clone(), cancel_clone.clone());
     }
