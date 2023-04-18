@@ -178,7 +178,7 @@ Deno.test(
     const readResult = await conn.read(resp) ?? 0;
     assertMatch(
       new TextDecoder().decode(resp.subarray(0, readResult)),
-      /HTTP\/1\.1 200 OK\r\nContent-Type: .*\r\nContent-Length: 0\r\nDate: .*\r\n\r\n/i);
+      /HTTP\/1\.1 200 OK\r\nContent-Type: .*\r\nVary: Accept-Encoding\r\nContent-Length: 0\r\nDate: .*\r\n\r\n/i);
 
     conn.close();
 
@@ -427,6 +427,9 @@ Deno.test(
 Deno.test(
   { permissions: { net: true } },
   async function httpServerCancelBodyOnResponseFailure() {
+    let cancelReasonResolver: (_: string) => void;
+    const cancelReasonPromise = new Promise<string>(r => cancelReasonResolver = r);
+
     const promise = (async () => {
       const listener = Deno.listen({ port: 4501 });
       const conn = await listener.accept();
@@ -434,7 +437,6 @@ Deno.test(
       const event = await httpConn.nextRequest();
       assert(event);
       const { respondWith } = event;
-      let cancelReason: string;
       await assertRejects(
         async () => {
           let interval = 0;
@@ -448,7 +450,7 @@ Deno.test(
                   }, 200);
                 },
                 cancel(reason) {
-                  cancelReason = reason;
+                  cancelReasonResolver(reason);
                   clearInterval(interval);
                 },
               }),
@@ -456,15 +458,50 @@ Deno.test(
           );
         },
         Deno.errors.Http,
-        cancelReason!,
+        "connection closed before message completed",
       );
-      assert(cancelReason!);
       await httpConn!.close();
       listener.close();
     })();
 
     const resp = await fetch("http://127.0.0.1:4501/");
     await resp.body!.cancel();
+    await promise;
+    assertMatch(await cancelReasonPromise, /connection closed before message completed/);
+  },
+);
+
+Deno.test(
+  { permissions: { net: true } },
+  async function httpServerParallelAccept() {
+    const promise = (async () => {
+      const listener = Deno.listen({ port: 4501 });
+      const conn = await listener.accept();
+      const httpConn = Deno.serveHttp(conn);
+      const nextRequest1 = httpConn.nextRequest();
+      const nextRequest2 = httpConn.nextRequest();
+      {
+        const event1 = await nextRequest1;
+        assert(event1);
+        const { request, respondWith } = event1;
+        await respondWith(new Response("1"));
+      }
+      {
+        const event2 = await nextRequest2;
+        assert(event2);
+        const { request, respondWith } = event2;
+        await respondWith(new Response("2"));
+      }
+
+      await httpConn!.close();
+      listener.close();
+    })();
+
+    const resp1 = await fetch("http://127.0.0.1:4501/path1");
+    await resp1.text();
+    const resp2 = await fetch("http://127.0.0.1:4501/path2");
+    await resp2.text();
+
     await promise;
   },
 );
@@ -505,6 +542,7 @@ Deno.test(
       );
       // The error from `op_http_accept` reroutes to `respondWith()`.
       assertEquals(await nextRequestPromise, null);
+      console.log(123);
       listener.close();
     })();
 

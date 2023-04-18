@@ -78,6 +78,9 @@ impl std::fmt::Debug for ResponseBytesInner {
   }
 }
 
+/// This represents the union of possible response types in Deno with the stream-style [`Body`] interface
+/// required by hyper. As the API requires information about request completion (including a success/fail
+/// flag), we include a very lightweight [`CompletionHandle`] for interested parties to listen on. 
 #[derive(Debug, Default)]
 pub struct ResponseBytes(ResponseBytesInner, CompletionHandle);
 

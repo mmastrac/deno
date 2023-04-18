@@ -608,7 +608,7 @@ pub async fn op_http_track(state: Rc<RefCell<OpState>>, index: usize, server_rid
 
   let res = match handle.or_cancel(cancel_handle).await {
     Ok(true) => Ok(()),
-    Ok(false) => Err(AnyError::msg("failed to write entire stream")),
+    Ok(false) => Err(AnyError::msg("connection closed before message completed")),
     Err(e) => Ok(()),
   };
 

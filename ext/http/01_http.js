@@ -96,10 +96,10 @@ class HttpConn {
     const context = new CallbackContext();
     const onError = this.#onError.bind(this);
 
-    const callback = map_to_userland(this.#requests, context, (req, responsePromise) => {
+    const callback = mapToCallback(this.#requests, context, (req, responsePromise) => {
       const promise = new Promise(r => {
         connections.push([r, req, responsePromise]);
-        waiters.pop()?.(true);
+        waiters.shift()?.(true);
       });
       return promise;
     }, true, onError);
@@ -114,12 +114,14 @@ class HttpConn {
       try {
         while (true) {
           const req = await core.opAsync("op_http_wait", httpRid);
+          console.log(req);
           if (req == 0xffffffff) {
             break;
           }
           callback(req);
         }
       } catch (e) {
+        console.log(e);
         // TODO(mmastrac): Is this the right way to get the exception?
         onError(new Deno.errors.Http(e.message));
       } finally {
@@ -153,7 +155,8 @@ class HttpConn {
       if (this.#closed) {
         return null;
       }
-      const conn = this.#connections.pop();
+      const conn = this.#connections.shift();
+      console.log("conn", conn);
       if (conn) {
         return { request: conn[1], respondWith: (resp) => { 
           console.log("respond");
@@ -538,12 +541,19 @@ async function asyncResponse(req, stream) {
   console.log("stm");
 }
 
-function map_to_userland(requests, context, callback, wantsPromise, onError) {
+function mapToCallback(requests, context, callback, wantsPromise, onError) {
   return function(req) {
     const innerRequest = new InnerRequest(req, context.fallback_base_url);
     requests.add(innerRequest);
     const request = fromInnerRequest(innerRequest, "immutable");
-    const response = callback(request, wantsPromise ? core.opAsync("op_http_track", req, context.server_rid) : undefined);
+    const promise = wantsPromise ? (async () => {
+      try {
+        await core.opAsync("op_http_track", req, context.server_rid);
+      } catch (e) {
+        throw new Deno.errors.Http(e);
+      }
+    })() : undefined;
+    const response = callback(request, promise);
     return (async () => {
       try {
         const inner = toInnerResponse(await response);
@@ -628,7 +638,7 @@ async function serve(arg1, arg2) {
   // TODO(mmastrac): clean these up on abort
   const requests = new SafeSet();
   const context = new CallbackContext();
-  const callback = map_to_userland(requests, context, handler, false, onError);
+  const callback = mapToCallback(requests, context, handler, false, onError);
 
   let rid;
   if (options.cert || options.key) {
