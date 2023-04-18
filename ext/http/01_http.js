@@ -75,64 +75,22 @@ class HttpConn {
   #closed = false;
   #remoteAddr;
   #localAddr;
-  #connections;
-  #waiters;
   #httpRid;
   #requests;
   #error;
   #closePromise;
   #closeResolve;
+  #context;
 
   constructor(rid, remoteAddr, localAddr) {
     this.#remoteAddr = remoteAddr;
     this.#localAddr = localAddr;
-    this.#connections = [];
-    this.#waiters = [];
     this.#requests = new Set();
     this.#closePromise = new Promise(r => this.#closeResolve = r);
 
-    const connections = this.#connections;
-    const waiters = this.#waiters;
-    const context = new CallbackContext();
-    const onError = this.#onError.bind(this);
-
-    const callback = mapToCallback(this.#requests, context, (req, responsePromise) => {
-      const promise = new Promise(r => {
-        connections.push([r, req, responsePromise]);
-        waiters.shift()?.(true);
-      });
-      return promise;
-    }, true, onError);
-
-    this.#httpRid = core.ops.op_serve_http_on(rid, context.initialize.bind(context));
-    context.server_rid = this.#httpRid;
-
-    // Start the async IIFE to avoid looking like the event loop stalled
-    const httpRid = this.#httpRid;
-    // TODO(mmastrac): This IIFE should be the close promise
-    (async () => {
-      try {
-        while (true) {
-          const req = await core.opAsync("op_http_wait", httpRid);
-          console.log(req);
-          if (req == 0xffffffff) {
-            break;
-          }
-          callback(req);
-        }
-      } catch (e) {
-        console.log(e);
-        // TODO(mmastrac): Is this the right way to get the exception?
-        onError(new Deno.errors.Http(e.message));
-      } finally {
-        // TODO(mmastrac): We might want to consider using close here
-        for (const waiter of this.#waiters) {
-          waiter(false);
-        }
-        this.#closed = true;
-        this.#closeResolve()
-      }
-    })()
+    this.#context = new CallbackContext();
+    this.#httpRid = core.ops.op_serve_http_on(rid, this.#context.initialize.bind(this.#context));
+    this.#context.server_rid = this.#httpRid;
   }
 
   #onError(e) {
@@ -140,44 +98,41 @@ class HttpConn {
     if (!this.#error) {
       this.#error = e;
     }
-    // Wake any waiters so they throw the exception
-    for (const waiter of this.#waiters) {
-      waiter(true);
-    }           
   }
 
   /** @returns {Promise<RequestEvent | null>} */
   async nextRequest() {
-    while (true) {
-      if (this.#error) {
-        throw this.#error;
-      }
-      if (this.#closed) {
-        return null;
-      }
-      const conn = this.#connections.shift();
-      console.log("conn", conn);
-      if (conn) {
-        return { request: conn[1], respondWith: (resp) => { 
-          console.log("respond");
-          conn[0](resp);
-          console.log("responded");
-          // Return a promise tracking the state of the response
-          return conn[2];
-        } };
-      }
-      const wakeup = new Promise(r => this.#waiters.push(r));
-      if (await wakeup === false) {
-        return null;
-      }
+    if (this.#error) {
+      throw this.#error;
     }
+    if (this.#closed) {
+      return null;
+    }
+    console.log('nextRequest');
+    const req = await core.opAsync("op_http_wait", this.#httpRid);
+    if (req == 0xffffffff) {
+      return null;
+    }
+
+    // We need to turn this callback function inside-out
+
+    let reqResolver, respResolver;
+    const reqPromise = new Promise(r => reqResolver = r);
+    const respPromise = new Promise(r => respResolver = r);
+    const callback = mapToCallback(this.#requests, this.#context, (request, responsePromise) => {
+      reqResolver({ request, respondWith: (resp) => {
+        respResolver(resp);
+        return responsePromise;
+      } });
+      return respPromise;
+    }, true, this.#onError.bind(this));
+
+    callback(req);
+    return reqPromise;
   }
 
   /** @returns {void} */
   async close() {
-    for (const waiter of this.#waiters) {
-      waiter(false);
-    }
     for (const request of this.#requests) {
       request.close();
     }
@@ -185,7 +140,7 @@ class HttpConn {
     // Don't allow further listening
     this.#closed = true;
     core.tryClose(this.#httpRid);
-    await this.#closePromise;
+    // await this.#closePromise;
   }
 
   [SymbolAsyncIterator]() {

@@ -12,6 +12,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 use bytes::Bytes;
+use deno_core::AsyncRefCell;
 use deno_core::CancelFuture;
 use deno_core::CancelHandle;
 use deno_core::WriteOutcome;
@@ -666,7 +667,7 @@ fn serve_http_on(
   }
 }
 
-struct HttpJoinHandle(RefCell<Option<JoinHandle<Result<(), AnyError>>>>, Rc<CancelHandle>, RefCell<tokio::sync::mpsc::Receiver<usize>>);
+struct HttpJoinHandle(RefCell<Option<JoinHandle<Result<(), AnyError>>>>, Rc<CancelHandle>, Rc<AsyncRefCell<tokio::sync::mpsc::Receiver<usize>>>);
 
 impl Resource for HttpJoinHandle {
   fn name(&self) -> Cow<str> {
@@ -715,7 +716,7 @@ pub fn op_serve_http<'scope>(
     state
       .borrow_mut()
       .resource_table
-      .add(HttpJoinHandle(RefCell::new(Some(handle)), cancel, RefCell::new(rx))),
+      .add(HttpJoinHandle(RefCell::new(Some(handle)), cancel, Rc::new(AsyncRefCell::new(rx)))),
   )
 }
 
@@ -745,7 +746,7 @@ pub fn op_serve_http_on<'scope>(
     state
       .borrow_mut()
       .resource_table
-      .add(HttpJoinHandle(RefCell::new(Some(handle)), cancel, RefCell::new(rx))),
+      .add(HttpJoinHandle(RefCell::new(Some(handle)), cancel, Rc::new(AsyncRefCell::new(rx)))),
   )
 }
 
@@ -759,10 +760,20 @@ pub async fn op_http_wait(
     .resource_table
     .get::<HttpJoinHandle>(rid)?;
 
+  let cancel = handle.1.clone();
+
   println!("wait");
-  let mut recv = handle.2.borrow_mut();
-  match recv.recv().await {
-    None => {
+  let recv = handle.2.borrow_mut().or_cancel(cancel.clone()).await;
+  let mut recv = match recv {
+    Err(_canceled) => return Ok(u32::MAX),
+    Ok(recv) => recv,
+  };
+
+  println!("got lock");
+  match recv.recv().or_cancel(cancel).await {
+    Err(_canceled) => { return Ok(u32::MAX); },
+    Ok(None) => {
+      println!("end");
       let res = handle.0.borrow_mut().take().unwrap().await?;
 
       // Drop the cancel and join handles
@@ -781,7 +792,8 @@ pub async fn op_http_wait(
       }
       return Ok(u32::MAX);
     }
-    Some(req) => {
+    Ok(Some(req)) => {
+      println!("req");
       return Ok(req as u32);
     }
   }
