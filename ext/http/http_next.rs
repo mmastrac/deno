@@ -16,6 +16,7 @@ use crate::slab::slab_insert;
 use crate::slab::SlabId;
 use crate::websocket_upgrade::WebSocketUpgrade;
 use crate::LocalExecutor;
+use bytes::Bytes;
 use cache_control::CacheControl;
 use deno_core::error::AnyError;
 use deno_core::futures::TryFutureExt;
@@ -35,6 +36,7 @@ use deno_core::OpState;
 use deno_core::RcRef;
 use deno_core::Resource;
 use deno_core::ResourceId;
+use deno_core::v8::CallbackScope;
 use deno_net::ops_tls::TlsStream;
 use deno_net::raw::NetworkStream;
 use deno_websocket::ws_create_server_stream;
@@ -62,8 +64,10 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::future::Future;
+use std::future::pending;
 use std::io;
 use std::pin::Pin;
+use std::ptr::NonNull;
 use std::rc::Rc;
 
 use tokio::io::AsyncReadExt;
@@ -938,6 +942,63 @@ pub fn op_http_try_wait(state: &mut OpState, rid: ResourceId) -> SlabId {
   };
 
   id
+}
+
+#[op(v8)]
+pub fn op_http_sync_serve<HTTP>(
+  scope: &mut v8::HandleScope,
+  state: Rc<RefCell<OpState>>,
+  rid: ResourceId,
+  function: serde_v8::Value,
+) -> Result<impl Future<Output = Result<(), AnyError>>, AnyError> where
+  HTTP: HttpPropertyExtractor + 'static,
+{
+  let listener = HTTP::get_listener_for_rid(&mut  state.borrow_mut(), rid).unwrap();
+  let function: v8::Local<v8::Function> = function.v8_value.try_into().unwrap();
+  let function = v8::Global::new(scope, function).into_raw();
+  let context = scope.get_current_context();
+  let context = v8::Global::new(scope, context).into_raw();
+
+  let handle = spawn(async move {
+    loop {
+      let conn = HTTP::accept_connection_from_listener(&listener).await?;
+      let network_stream = HTTP::to_network_stream_from_connection(conn);
+      match network_stream {
+        NetworkStream::Tcp(conn) => {
+          spawn(async move {
+            let bytes = Bytes::from_static("hello world".as_bytes());
+            http1::Builder::new()
+              .serve_connection(
+                conn,
+                hyper1::service::service_fn(move |req| async move {
+                  let function = unsafe { std::mem::transmute::<
+                    NonNull<v8::Function>,
+                    v8::Local<v8::Function>,
+                  >(function) };
+                  let context = unsafe { std::mem::transmute::<
+                    NonNull<v8::Context>,
+                    v8::Local<v8::Context>,
+                  >(context) };
+                  let mut scope = unsafe { CallbackScope::new(context) };
+                  let mut scope = v8::HandleScope::new(&mut scope);
+                  scope.get_current_context();
+                  let recv = v8::undefined(&mut scope).into();
+                  function.call(&mut scope, recv, &[]);
+                  Ok::<_, AnyError>(hyper1::Response::new(
+                    "hello world".to_string(),
+                  ))
+                }),
+              )
+              .await;
+          });
+        }
+        _ => unreachable!(),
+      }
+    };
+    #[allow(unreachable_code)]
+    Ok::<_, AnyError>(())
+  });
+  Ok(pending())
 }
 
 #[op]
