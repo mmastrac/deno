@@ -30,6 +30,12 @@ use http::Request;
 use http::Uri;
 use hyper::Body;
 use once_cell::sync::Lazy;
+use rustls::RootCertStore;
+use rustls::RootCertStore;
+use rustls::ServerName;
+use rustls::ServerName;
+use rustls_tokio_stream::TlsStream;
+use rustls_tokio_stream::TlsStream;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -43,9 +49,6 @@ use std::sync::Arc;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::RootCertStore;
-use tokio_rustls::rustls::ServerName;
-use tokio_rustls::TlsConnector;
 
 use fastwebsockets::CloseCode;
 use fastwebsockets::FragmentCollector;
@@ -281,11 +284,16 @@ where
         unsafely_ignore_certificate_errors,
         None,
       )?;
-      let tls_connector = TlsConnector::from(Arc::new(tls_config));
       let dnsname = ServerName::try_from(domain.as_str())
         .map_err(|_| invalid_hostname(domain))?;
-      let tls_socket = tls_connector.connect(dnsname, tcp_socket).await?;
-      handshake(cancel_resource, request, tls_socket).await?
+      let mut tls_connector = TlsStream::new_client_side(
+        tcp_socket,
+        tls_config.into(),
+        dnsname,
+        NonZeroUsize::new(65536),
+      );
+      let _hs = tls_connector.handshake().await?;
+      handshake(cancel_resource, request, tls_connector).await?
     }
     _ => unreachable!(),
   };
@@ -413,16 +421,20 @@ pub fn ws_create_server_stream(
 fn send_binary(state: &mut OpState, rid: ResourceId, data: &[u8]) {
   let resource = state.resource_table.get::<ServerWebSocket>(rid).unwrap();
   let data = data.to_vec();
+  println!("data: {}", data.len());
   let len = data.len();
   resource.buffered.set(resource.buffered.get() + len);
   let lock = resource.reserve_lock();
   deno_core::unsync::spawn(async move {
+    println!("writing");
     if let Err(err) = resource
       .write_frame(lock, Frame::new(true, OpCode::Binary, None, data.into()))
       .await
     {
+      println!("err");
       resource.set_error(Some(err.to_string()));
     } else {
+      println!("ok");
       resource.buffered.set(resource.buffered.get() - len);
     }
   });
@@ -628,9 +640,15 @@ pub async fn op_ws_next_event(
     return MessageKind::Error as u16;
   }
 
+  println!("locking...");
   let mut ws = RcRef::map(&resource, |r| &r.ws).borrow_mut().await;
+  println!("lockeds...");
   loop {
-    let val = match ws.read_frame().await {
+    tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+    println!("reading...");
+    let val = ws.read_frame().await;
+    println!("read...");
+    let val = match val {
       Ok(val) => val,
       Err(err) => {
         // No message was received, socket closed while we waited.
@@ -644,6 +662,7 @@ pub async fn op_ws_next_event(
       }
     };
 
+    println!("val = {:?}", val.opcode);
     break match val.opcode {
       OpCode::Text => match String::from_utf8(val.payload.to_vec()) {
         Ok(s) => {

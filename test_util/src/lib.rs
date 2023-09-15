@@ -338,6 +338,7 @@ async fn echo_websocket_handler(
     match frame.opcode {
       fastwebsockets::OpCode::Close => break,
       fastwebsockets::OpCode::Text | fastwebsockets::OpCode::Binary => {
+        println!("got frame! {}", frame.payload.len());
         ws.write_frame(frame).await.unwrap();
       }
       _ => {}

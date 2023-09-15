@@ -1,4 +1,5 @@
 // Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+import console from "node:console";
 import {
   assert,
   assertEquals,
@@ -23,6 +24,59 @@ Deno.test(async function websocketConstructorTakeURLObjectAsParameter() {
   assertEquals(ws.url, "ws://localhost:4242/");
   ws.onerror = () => fail();
   ws.onopen = () => ws.close();
+  ws.onclose = () => {
+    promise.resolve();
+  };
+  await promise;
+});
+
+Deno.test(async function websocketSendLargePacket() {
+  const promise = deferred();
+  const ws = new WebSocket(new URL("wss://localhost:4243/"));
+  assertEquals(ws.url, "wss://localhost:4243/");
+  ws.onerror = () => fail();
+  ws.onopen = () => {
+    ws.send("a".repeat(65000));
+  }
+  ws.onmessage = () => {
+    ws.close();
+  }
+  ws.onclose = () => {
+    promise.resolve();
+  };
+  await promise;
+});
+
+Deno.test(async function websocketSendLargeBinaryPacket() {
+  const promise = deferred();
+  const ws = new WebSocket(new URL("wss://localhost:4243/"));
+  assertEquals(ws.url, "wss://localhost:4243/");
+  ws.onerror = () => fail();
+  ws.onopen = () => {
+    ws.send(new Uint8Array(65000));
+  }
+  ws.onmessage = (msg) => {
+    console.log(msg);
+    ws.close();
+  }
+  ws.onclose = () => {
+    promise.resolve();
+  };
+  await promise;
+});
+
+Deno.test(async function websocketSendLargeBlobPacket() {
+  const promise = deferred();
+  const ws = new WebSocket(new URL("wss://localhost:4243/"));
+  assertEquals(ws.url, "wss://localhost:4243/");
+  ws.onerror = () => fail();
+  ws.onopen = () => {
+    ws.send(new Blob(["a".repeat(10)]));
+  }
+  ws.onmessage = (msg) => {
+    console.log(msg);
+    ws.close();
+  }
   ws.onclose = () => {
     promise.resolve();
   };

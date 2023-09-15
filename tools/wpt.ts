@@ -594,7 +594,7 @@ function reportVariation(result: TestResult, expectation: boolean | string[]) {
 
     const expectFail = expectation === false;
     const failReason = result.status !== 0
-      ? "runner failed during test"
+      ? `runner failed during test: >>>>>>>\n${result.stderr}\n<<<<<<<\n`
       : "the event loop run out of tasks during the test";
     console.log(
       `\nfile result: ${

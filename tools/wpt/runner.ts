@@ -54,6 +54,7 @@ export interface TestResult {
   duration: number;
   status: number;
   stderr: string;
+  stdout: string;
 }
 
 export interface TestHarnessStatus {
@@ -124,7 +125,7 @@ export async function runSingleTest(
       env: {
         NO_COLOR: "1",
       },
-      stdout: "null",
+      stdout: "piped",
       stderr: "piped",
     }).spawn();
 
@@ -136,12 +137,21 @@ export async function runSingleTest(
     const lines = proc.stderr.pipeThrough(new TextDecoderStream()).pipeThrough(
       new TextLineStream(),
     );
+    const stdoutLines = proc.stdout.pipeThrough(new TextDecoderStream()).pipeThrough(
+      new TextLineStream(),
+    );
     interval = setInterval(() => {
       const passedTime = performance.now() - start;
       if (passedTime > timeout) {
         proc.kill("SIGINT");
       }
     }, 1000);
+    let stdout = "";
+    (async () => {
+      for await (const line of stdoutLines) {
+        stdout += line + "\n";
+      }
+    })();
     for await (const line of lines) {
       if (line.startsWith("{")) {
         const data = JSON.parse(line);
@@ -167,6 +177,7 @@ export async function runSingleTest(
       duration,
       cases,
       stderr,
+      stdout,
     };
   } finally {
     clearInterval(interval);
