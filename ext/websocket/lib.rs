@@ -419,20 +419,16 @@ pub fn ws_create_server_stream(
 fn send_binary(state: &mut OpState, rid: ResourceId, data: &[u8]) {
   let resource = state.resource_table.get::<ServerWebSocket>(rid).unwrap();
   let data = data.to_vec();
-  println!("data: {}", data.len());
   let len = data.len();
   resource.buffered.set(resource.buffered.get() + len);
   let lock = resource.reserve_lock();
   deno_core::unsync::spawn(async move {
-    println!("writing");
     if let Err(err) = resource
       .write_frame(lock, Frame::new(true, OpCode::Binary, None, data.into()))
       .await
     {
-      println!("err");
       resource.set_error(Some(err.to_string()));
     } else {
-      println!("ok");
       resource.buffered.set(resource.buffered.get() - len);
     }
   });
@@ -638,14 +634,9 @@ pub async fn op_ws_next_event(
     return MessageKind::Error as u16;
   }
 
-  println!("locking...");
   let mut ws = RcRef::map(&resource, |r| &r.ws).borrow_mut().await;
-  println!("lockeds...");
   loop {
-    tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
-    println!("reading...");
     let val = ws.read_frame().await;
-    println!("read...");
     let val = match val {
       Ok(val) => val,
       Err(err) => {
@@ -660,7 +651,6 @@ pub async fn op_ws_next_event(
       }
     };
 
-    println!("val = {:?}", val.opcode);
     break match val.opcode {
       OpCode::Text => match String::from_utf8(val.payload.to_vec()) {
         Ok(s) => {
