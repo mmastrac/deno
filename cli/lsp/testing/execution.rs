@@ -31,6 +31,7 @@ use deno_runtime::tokio_util::create_and_run_current_thread;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -212,7 +213,7 @@ impl TestRun {
   ) -> Result<(), AnyError> {
     let args = self.get_args();
     lsp_log!("Executing test run with arguments: {}", args.join(" "));
-    let flags = flags_from_vec(args.into_iter().map(String::from).collect())?;
+    let flags = flags_from_vec(args.into_iter().map(OsString::from).collect())?;
     let factory = CliFactory::from_flags(flags).await?;
     // Various test files should not share the same permissions in terms of
     // `PermissionsContainer` - otherwise granting/revoking permissions in one
