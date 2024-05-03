@@ -4,6 +4,7 @@ mod in_memory_fs;
 mod interface;
 mod ops;
 mod std_fs;
+mod vfs2;
 pub mod sync;
 
 pub use crate::in_memory_fs::InMemoryFs;
